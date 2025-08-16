@@ -1,0 +1,126 @@
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+from matplotlib import gridspec
+from scipy.stats import gaussian_kde, skew, kurtosis
+from matplotlib.colors import Normalize
+import datetime as dt
+import io
+from IPython.display import display
+import ipywidgets as widgets
+
+def compute_cvar(vals, percentile=5):
+    cutoff = np.percentile(vals, percentile)
+    return vals[vals <= cutoff].mean()
+
+def run_mc(stocks, weights, start, end, sims_n, T, init, rf):
+    df = yf.download(stocks, start=start, end=end, auto_adjust=False, progress=False)['Close'].ffill()
+    r = df.pct_change().dropna()
+    mu, cov = r.mean(), r.cov()
+    simulations = np.zeros((T, sims_n))
+    finals = np.zeros(sims_n)
+    for i in range(sims_n):
+        dr = np.random.multivariate_normal(mu.values, cov.values, T)
+        simulations[:, i] = init * np.cumprod(1 + dr.dot(weights))
+        finals[i] = simulations[-1, i]
+    rets = np.log(simulations[1:] / simulations[:-1]).flatten()
+    ann_ret = rets.mean() * 252
+    ann_vol = rets.std() * np.sqrt(252)
+    downside = rets[rets < 0]
+    sharpe = (ann_ret - rf) / (ann_vol + 1e-9)
+    sortino = (ann_ret - rf) / (np.std(downside) * np.sqrt(252) + 1e-9)
+    sk = skew(finals); ku = kurtosis(finals, fisher=True)
+    cum_mean = np.cumsum(finals) / np.arange(1, sims_n + 1)
+    stderr = np.std(finals, ddof=1) / np.sqrt(np.arange(1, sims_n + 1))
+    return simulations, finals, (cum_mean, stderr), {"Media simulazione": cum_mean[-1], "Minimo": finals.min(), "Massimo": finals.max(), "5° percentile (VaR)": np.percentile(finals, 5),
+        "95° percentile": np.percentile(finals, 95), "CVaR 5%": compute_cvar(finals), "Rendimento annuo %": ann_ret * 100, "Volatilità annua %": ann_vol * 100,
+        "Sharpe Ratio": sharpe, "Sortino Ratio": sortino, "Skewness": sk, "Kurtosis": ku, "StdErr media": stderr[-1], "CoeffVar": stderr[-1] / cum_mean[-1]}
+
+layout = widgets.Layout(width='80%')
+tickers_w = widgets.Text(value='META,NVDA', description='Tickers:', layout=layout)
+weights_w = widgets.Text(value='0.5,0.5', description='Pesi:', layout=layout)
+start_w = widgets.DatePicker(value=dt.date.today()-dt.timedelta(days=300), description='Inizio:', layout=layout)
+sims_w = widgets.IntSlider(value=10000, min=1000, max=20000, step=1000, description='Simulazioni:', layout=layout)
+T_w = widgets.IntSlider(value=252, min=30, max=365, step=1, description='Giorni T:', layout=layout)
+init_w = widgets.IntText(value=10000, description='Valore iniziale:', layout=layout)
+rf_w = widgets.FloatText(value=0.0425, description='Risk‑free %:', layout=layout)
+run_btn = widgets.Button(description='Esegui simulazione', style=widgets.ButtonStyle(button_color='#5FA8D3'))
+out = widgets.Output()
+
+def smart_val_format(x):
+    return f"{x:.2e}" if abs(x) < 0.01 else f"{x:,.2f}"
+
+def on_run(_):
+    with out:
+        out.clear_output()
+
+        tk = [t.strip().upper() for t in tickers_w.value.split(',')]
+        w = np.array([float(x) for x in weights_w.value.split(',')])
+        total_weight = w.sum()
+        if abs(total_weight - 1.0) > 1e-4:
+            raise ValueError(f"La somma dei pesi deve essere 1. Somma attuale = {total_weight:.4f}")
+
+        simulations, finals, (cum_mean, stderr), stats = run_mc(tk, w, start_w.value, dt.date.today(), sims_w.value, T_w.value, init_w.value, rf_w.value)
+
+        df = pd.DataFrame(stats.items(), columns=['Statistica', 'Valore'])
+        sty = (df.style.format({'Valore': smart_val_format}).background_gradient('Blues', subset=['Valore']).set_table_styles([{'selector': 'th', 'props': [('background-color', '#003366'), ('color', 'white'),('font-size', '14px')]},{'selector': 'td', 'props': [('padding', '6px'), ('font-size', '13px')]}]).set_caption("Statistiche Monte Carlo"))
+        display(sty)
+
+        fig = plt.figure(figsize=(14, 7))
+        fig.canvas.header_visible = False
+        fig.canvas.toolbar_visible = True
+        fig.canvas.footer_visible = False
+
+        gs = gridspec.GridSpec(1, 2, width_ratios=[4, 0.9], wspace=0)
+        ax0 = fig.add_subplot(gs[0])
+        ax1 = fig.add_subplot(gs[1], sharey=ax0)
+
+        cmap = plt.get_cmap('winter')
+        n = simulations.shape[1]
+        colors = [cmap(i / n) for i in range(n)]
+
+        for i in range(n):
+            ax0.plot(simulations[:, i], color=colors[i], alpha=0.35, lw=0.7)
+        ax0.grid(True, linestyle=':', linewidth=0.7, alpha=0.7)
+
+        N, bins, patches = ax1.hist(finals, bins=30, density=True, orientation='horizontal', edgecolor='white', lw=0.5)
+
+        norm = Normalize(vmin=0, vmax=N.max())
+        cmap_hist = plt.get_cmap('Blues')
+        for count, patch in zip(N, patches):
+            patch.set_facecolor(cmap_hist(norm(count)))
+        ax1.tick_params(axis='y', labelleft=False)
+
+        kde = gaussian_kde(finals)
+        ys = np.linspace(finals.min(), finals.max(), 1000)
+        dens = kde(ys)
+        ax1.plot(dens, ys, color='#5FA8D3', lw=2)
+        ax1.axhline(finals.mean(), color='#5FA8D3', ls='--', lw=1.5)
+
+        ax1.grid(True, linestyle=':', linewidth=0.7, alpha=0.6)
+
+        plt.tight_layout()
+        plt.show()
+
+        fig2, ax2 = plt.subplots(figsize=(10, 4))
+        fig2.canvas.header_visible = False
+        fig2.canvas.toolbar_visible = True
+        fig2.canvas.footer_visible = False
+
+        ax2.plot(cum_mean, label='Media cumulata', color='navy')
+        ax2.fill_between(np.arange(len(cum_mean)), cum_mean - stderr, cum_mean + stderr,
+        color='navy', alpha=0.2, label='±1 std err')
+        ax2.grid(True, linestyle='--', linewidth=0.6, alpha=0.7)
+        ax2.legend()
+        fig2.tight_layout()
+        plt.show()
+
+
+
+run_btn.on_click(on_run)
+ui = widgets.VBox([tickers_w, weights_w, start_w, sims_w, T_w, init_w, rf_w,
+    run_btn, out], layout=widgets.Layout(border='2px solid navy',
+    padding='10px', border_radius='8px'))
+
+display(ui)
