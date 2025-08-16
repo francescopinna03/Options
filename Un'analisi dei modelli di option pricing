@@ -1,0 +1,1412 @@
+import pandas as pd
+import yfinance as yf
+import numpy as np
+import pandas_market_calendars as mcal
+import warnings
+from scipy.optimize import minimize, differential_evolution, brentq
+from scipy.integrate import quad
+from scipy.interpolate import PchipInterpolator
+from scipy.stats import norm
+import io
+import contextlib
+import plotly.graph_objects as go
+import plotly.io as pio
+from scipy.interpolate import griddata
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+from IPython.display import display, clear_output, HTML
+import ipywidgets as widgets
+import plotly.graph_objects as go
+import plotly.io as pio
+
+pio.renderers.default = 'iframe'
+warnings.filterwarnings('ignore')
+FAIR_COMPARE = True
+_CRN_SEEDSEQ = None            
+
+def make_crn_workers(base_seed: int = 42):
+    state = {"gen": 0}
+
+    def map_like(func, iterable):
+        global _CRN_SEEDSEQ
+        _CRN_SEEDSEQ = np.random.SeedSequence(base_seed + state["gen"])
+        state["gen"] += 1
+        xs = list(iterable)            
+        return [func(x) for x in xs] 
+    return map_like
+
+class CRNMap:
+    def __init__(self, base_seed=12345):
+        self.base_seed = int(base_seed)
+        self.gen = 0
+
+    def __call__(self, func, iterable):
+        global _CRN_SEEDSEQ
+        _CRN_SEEDSEQ = np.random.SeedSequence(self.base_seed + self.gen)
+        self.gen += 1
+        xs = list(iterable)          
+        return [func(x) for x in xs]
+
+class DevLogger:
+    def __init__(self, out_widget=None, enabled=False):
+        import io as _io
+        self.enabled = bool(enabled)
+        self.out_widget = out_widget
+        self.stream = _io.StringIO()
+
+    def write(self, msg: str):
+        if not self.enabled:
+            return
+        if not msg.endswith("\n"):
+            msg += "\n"
+        # salva anche in buffer
+        print(msg, file=self.stream, end="")
+        # stampa live (veloce)
+        if self.out_widget is not None:
+            try:
+                self.out_widget.append_stdout(msg)
+            except Exception:
+                from contextlib import redirect_stdout
+                with self.out_widget, redirect_stdout(None):
+                    print(msg, end="")
+
+    def getvalue(self) -> str:
+        try:
+            return self.stream.getvalue()
+        except Exception:
+            return ""
+
+class ObjectiveRecorder:
+    def __init__(self, func):
+        self.func = func
+        self.last_x = None
+        self.last_f = None
+
+    def __call__(self, x, *args, **kwargs):
+        f = self.func(x, *args, **kwargs)
+        self.last_x = None if x is None else np.array(x, copy=True)
+        self.last_f = f
+        return f
+
+RISK_FREE_RATE = 0.0425  #1Y US Y-BILLS
+
+NEAR_SPOT_LOW  = 0.85
+NEAR_SPOT_HIGH = 1.15
+MAX_SPREAD_PCT = 0.30
+IV_MIN, IV_MAX = 1e-6, 2.5
+PRICE_MAX_MULT = 2.0
+REQUIRE_LIQUID = False
+
+def calculate_time_to_maturity(maturity_date, today=None):
+    if today is None:
+        today = pd.Timestamp.today()
+    nyse = mcal.get_calendar('NYSE')
+    trading_days = nyse.schedule(start_date=today, end_date=maturity_date)
+    return len(trading_days) / 252
+
+def get_spot_price(ticker):
+    return yf.Ticker(ticker).fast_info.last_price
+
+def black_scholes_price(S0, K, T, r, q, sigma, option_type='call'):
+    if sigma is None or sigma <= 0 or T <= 0:
+        return 0.0
+    d1 = (np.log(S0/K) + (r - q + 0.5*sigma**2)*T)/(sigma*np.sqrt(T))
+    d2 = d1 - sigma*np.sqrt(T)
+    if option_type.lower() == 'call':
+        return S0*np.exp(-q*T)*norm.cdf(d1) - K*np.exp(-r*T)*norm.cdf(d2)
+    else:
+        return K*np.exp(-r*T)*norm.cdf(-d2) - S0*np.exp(-q*T)*norm.cdf(-d1)
+
+def bs_implied_vol_from_price(price, S0, K, T, r, q, option_type='call', tol=1e-8):
+    def f(sig):
+        return black_scholes_price(S0, K, T, r, q, sig, option_type) - price
+    try:
+        return brentq(f, 1e-6, 5.0, xtol=tol)
+    except Exception:
+        return np.nan
+
+def bs_vega(S0, K, T, r, q, sigma):
+    if sigma is None or np.isnan(sigma) or sigma <= 0 or T <= 0:
+        return 0.0
+    d1 = (np.log(S0/K) + (r - q + 0.5*sigma**2)*T)/(sigma*np.sqrt(T))
+    return S0*np.exp(-q*T)*norm.pdf(d1)*np.sqrt(T)
+
+def crr_binomial_price(S, K, T, r, q, sigma, N=2000, option_type='call'):
+    dt = T / N
+    u = np.exp(sigma * np.sqrt(dt))
+    d = 1.0 / u
+    disc = np.exp(-r * dt)
+    p = (np.exp((r - q) * dt) - d) / (u - d)
+    p = np.clip(p, 0.0, 1.0)
+
+    ST = S * (d**np.arange(N, -1, -1)) * (u**np.arange(0, N+1))
+    if option_type.lower() == 'call':
+        payoff = np.maximum(ST - K, 0.0)
+    else:
+        payoff = np.maximum(K - ST, 0.0)
+
+    # backward induction (europea)
+    for i in range(N, 0, -1):
+        payoff = disc * (p * payoff[1:i+1] + (1 - p) * payoff[0:i])
+    return float(payoff[0])
+
+def monte_carlo_antithetic_control(S0, K, T, r, sigma, simulations=100000, steps=1, option_type='call', q=0.0):     # MC GBM con antitetiche + control variate su e^{-rT} S_T --> Boyle, P. P. (1977)
+    dt = T / steps
+    np.random.seed(42)
+    payoffs = []
+    ctrl_vals = []
+    expected_ctrl = S0 * np.exp(-q * T)  # E[e^{-rT} S_T] = S0 e^{-qT}
+    for _ in range(simulations // 2):
+        Z = np.random.randn(steps)
+        Z_ant = -Z
+        drift = (r - q - 0.5*sigma**2)*dt
+        vol   = sigma*np.sqrt(dt)
+        ST     = S0 * np.exp(np.sum(drift + vol*Z))
+        ST_ant = S0 * np.exp(np.sum(drift + vol*Z_ant))
+        if option_type == 'call':
+            payoff = max(ST - K, 0.0)
+            payoff_ant = max(ST_ant - K, 0.0)
+        else:
+            payoff = max(K - ST, 0.0)
+            payoff_ant = max(K - ST_ant, 0.0)
+        payoffs.append(0.5*(payoff + payoff_ant) * np.exp(-r * T))
+        ctrl_vals.append(0.5*(ST + ST_ant) * np.exp(-r * T))
+    X = np.array(payoffs)
+    Y = np.array(ctrl_vals)
+    if np.var(Y) == 0:
+        return float(X.mean())
+    c = - np.cov(X, Y)[0, 1] / np.var(Y)
+    adjusted = X + c * (Y - expected_ctrl)
+    return float(adjusted.mean())
+
+def heston_monte_carlo_jump(S, K, T, r, kappa, theta, v0, rho, xi, option_type='call', simulations=2000, steps=15, lambda_jump=0.1, mu_J=-0.1, sigma_J=0.2, q=0.0):       # Heston + salti lognormali (Merton) con correzione del drift
+    np.random.seed(42)
+    dt = T / steps
+    S_paths = np.zeros((steps + 1, simulations))
+    v_paths = np.zeros_like(S_paths)
+    S_paths[0] = S
+    v_paths[0] = v0
+    EJ = np.exp(mu_J + 0.5 * sigma_J**2)
+    drift_jump_comp = lambda_jump * (EJ - 1.0)
+    for t in range(1, steps + 1):
+        W = np.random.multivariate_normal([0, 0], [[1, rho], [rho, 1]], simulations)
+        v_prev = np.maximum(v_paths[t-1], 0.0)
+        N_jump = np.random.poisson(lambda_jump * dt, size=simulations)
+        J_sum = np.zeros(simulations)
+        mask = N_jump > 0
+        if mask.any():
+            J_sum[mask] = np.random.normal(loc=N_jump[mask]*mu_J, scale=np.sqrt(N_jump[mask])*sigma_J)
+        jump_factor = np.exp(J_sum)
+        drift = (r - q - drift_jump_comp - 0.5 * v_prev) * dt
+        v_paths[t] = np.maximum(v_prev + kappa*(theta - v_prev)*dt + xi*np.sqrt(np.maximum(v_prev, 0.0)*dt)*W[:, 1], 0.0)
+        S_paths[t] = S_paths[t-1] * np.exp(drift + np.sqrt(np.maximum(v_prev, 0.0)*dt) * W[:, 0]) * jump_factor
+    ST = S_paths[-1]
+    payoff = np.maximum(ST - K, 0.0) if option_type == 'call' else np.maximum(K - ST, 0.0)
+    return float(np.exp(-r * T) * payoff.mean())
+
+def _qe_variance_step(v, dt, kappa, theta, xi, Z2, rng):
+    v = np.asarray(v, dtype=float)
+    e = np.exp(-kappa * dt)
+
+    m = theta + (v - theta) * e
+    s2 = (v * xi**2) * e * (1.0 - e) / kappa + (theta * xi**2) * (1.0 - e)**2 / (2.0 * kappa)
+    s2 = np.maximum(s2, 0.0)
+
+    denom = (m * m) + 1e-16
+    psi = s2 / denom
+
+    v_next = np.empty_like(v)
+
+    maskA = psi <= 1.5
+    if np.any(maskA):
+        ps = psi[maskA]
+        mA = m[maskA]
+        b2 = 2.0 / ps - 1.0 + np.sqrt(2.0 / ps) * np.sqrt(np.maximum(2.0 / ps - 1.0, 0.0))
+        a = mA / (1.0 + b2)
+        v_next[maskA] = a * (np.sqrt(np.maximum(b2, 0.0)) + Z2[maskA])**2
+
+    maskB = ~maskA
+    if np.any(maskB):
+        ps = psi[maskB]
+        mB = m[maskB]
+        p = (ps - 1.0) / (ps + 1.0)                      # massa a 0
+        p = np.clip(p, 0.0, 1.0)
+        beta = (1.0 - p) / (mB + 1e-16)                 # parametro esponenziale
+        U = rng.random(np.sum(maskB))
+        vB = np.empty(np.sum(maskB), dtype=float)
+        mask0 = U <= p
+        if np.any(~mask0):
+            vB[~mask0] = rng.exponential(1.0 / (beta[~mask0] + 1e-16))
+        if np.any(mask0):
+            vB[mask0] = 0.0
+        v_next[maskB] = vB
+
+    return v_next
+
+def kou_compensator(p_up, eta1, eta2):
+    EJ = p_up * (eta1/(eta1 - 1.0)) + (1.0 - p_up) * (eta2/(eta2 + 1.0))
+    return EJ - 1.0
+
+def kou_one_shot_Y(N, p_up, eta1, eta2, rng):
+    if N <= 0:
+        return 0.0
+    n_up = rng.binomial(N, p_up)
+    n_dn = N - n_up
+    ups = rng.exponential(scale=1.0/eta1, size=n_up).sum() if n_up > 0 else 0.0
+    dns = rng.exponential(scale=1.0/eta2, size=n_dn).sum() if n_dn > 0 else 0.0
+    return ups - dns
+
+def sfv_qe_kou_paths(S0, T, r, q, kappa, theta, v0, xi, rho, gamma, lambda_S, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V, N=50, M=8000, rng=None):
+    if rng is None:
+        rng = np.random.default_rng()
+
+    S = np.full(M, float(S0))
+    v = np.full(M, float(v0))
+    sqrt_1mr2 = np.sqrt(max(1.0 - rho * rho, 0.0))
+
+    dt = float(T) / int(N)
+    dt = max(dt, 1e-8)
+
+    Ey = p_up * (eta1 / (eta1 - 1.0)) + (1.0 - p_up) * (eta2 / (eta2 + 1.0))
+    comp_S = lambda_S * (Ey - 1.0)
+
+    for _ in range(int(N)):
+        Z1 = rng.standard_normal(M)
+        Z2_ind = rng.standard_normal(M)
+        dW_S = Z1
+        Z2 = rho * Z1 + sqrt_1mr2 * Z2_ind
+        v_next = _qe_variance_step(v, dt, kappa, theta, xi, Z2, rng)
+
+        v_pos = np.maximum(v, 0.0)
+        v_next_pos = np.maximum(v_next, 0.0)
+        I = 0.5 * (v_pos + v_next_pos) * dt
+
+        dS_over_S_cont = (r - q - comp_S) * dt - 0.5 * I + np.sqrt(np.maximum(I, 0.0)) * dW_S
+
+        feedback = gamma * np.sqrt(np.maximum(I, 0.0)) * dW_S
+
+        N_S = rng.poisson(lambda_S * dt, size=M)
+        J_S_log = np.zeros(M, dtype=float)
+        idx = np.where(N_S > 0)[0]
+        for i in idx:
+            n = int(N_S[i])
+            if n <= 0:
+                continue
+            n_up = rng.binomial(n, p_up)
+            n_dn = n - n_up
+            if n_up > 0:
+                J_S_log[i] += rng.exponential(1.0 / eta1, size=n_up).sum()
+            if n_dn > 0:
+                J_S_log[i] -= rng.exponential(1.0 / eta2, size=n_dn).sum()
+        J_S = np.exp(J_S_log)
+
+        N_V = rng.poisson(lambda_V * dt, size=M)
+        J_log = np.zeros(M, dtype=float)
+        maskV = N_V > 0
+        if np.any(maskV):
+            J_log[maskV] = rng.normal(loc=mu_J_V * N_V[maskV], scale=sigma_J_V * np.sqrt(N_V[maskV]))
+        J_V_factor = np.exp(J_log)  # >= 0
+
+        S = S * np.exp(dS_over_S_cont) * J_S
+        v = np.maximum(v_next * J_V_factor + feedback, 0.0)
+
+    return S, v
+
+def price_call_option_qe_kou(S0, v0, K, T, r, q,kappa, theta, xi, gamma,lambda_S, p_up_S, eta1_S, eta2_S,lambda_V, mu_J_V, sigma_J_V,rho=0.0, M=20000, N=1, seed=42):
+    rng = np.random.default_rng(seed)
+    S_T, _ = sfv_qe_kou_paths(S0, T, r, q, kappa, theta, v0, xi, rho, gamma, lambda_S, p_up_S, eta1_S, eta2_S, lambda_V, mu_J_V, sigma_J_V, N=N, M=M, rng=rng)
+    payoff = np.maximum(S_T - K, 0.0)
+    return float(np.exp(-r * T) * payoff.mean())
+
+def price_put_option_qe_kou(S0, v0, K, T, r, q, kappa, theta, xi, gamma, lambda_S, p_up_S, eta1_S, eta2_S, lambda_V, mu_J_V, sigma_J_V, rho=0.0, M=20000, N=1, seed=42):
+    rng = np.random.default_rng(seed)
+    S_T, _ = sfv_qe_kou_paths(S0, T, r, q, kappa, theta, v0, xi, rho, gamma, lambda_S, p_up_S, eta1_S, eta2_S, lambda_V, mu_J_V, sigma_J_V, N=N, M=M, rng=rng)
+    payoff = np.maximum(K - S_T, 0.0)
+    return float(np.exp(-r * T) * payoff.mean())
+    
+try:
+    FAIR_COMPARE
+except NameError:
+    FAIR_COMPARE = True  
+
+_CRN_SEEDSEQ = None  
+
+def obj_sfv_jump_qe(p, S, r, q, T, strikes, market_mid, iv_mkt=None, w_pre=None, liq_weights=None, vols_bounds=(1e-4, 5.0), N_step=50, M=8000, alpha=1.0, rng=None, reg_weights=None):
+    ss = globals().get("_CRN_SEEDSEQ", None)
+    if ss is not None:
+        rng = np.random.default_rng(ss)
+    elif rng is None:
+        rng = np.random.default_rng()
+
+    strikes = np.asarray(strikes, dtype=float)
+    market_mid = np.asarray(market_mid, dtype=float)
+    if iv_mkt is not None:
+        iv_mkt = np.asarray(iv_mkt, dtype=float)
+
+    p = np.asarray(p, dtype=float).ravel()
+    if p.size != 13:
+        raise ValueError(f"Attesi 13 parametri, ricevuti {p.size}")       #debug dopo test 29/7
+
+    def _unpackA(pp):
+        kappa, theta, v0, xi, rho,  gamma, lambda_S, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V = pp
+        return kappa, theta, v0, xi, rho, gamma, lambda_S, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V
+    def _unpackB(pp):
+        kappa, theta, v0, xi, gamma, lambda_S, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V, rho = pp
+        return kappa, theta, v0, xi, rho, gamma, lambda_S, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V
+
+    pars = None
+    try:
+        cand = _unpackA(p)
+        _rho, _pup, _e1, _e2 = cand[4], cand[7], cand[8], cand[9]
+        if (-0.999 <= _rho <= 0.999) and (0 < _pup < 1) and (_e1 > 1) and (_e2 > 0):
+            pars = cand
+    except Exception:
+        pass
+    if pars is None:
+        cand = _unpackB(p)
+        _rho, _pup, _e1, _e2 = cand[4], cand[7], cand[8], cand[9]
+        if not ((-0.999 <= _rho <= 0.999) and (0 < _pup < 1) and (_e1 > 1) and (_e2 > 0)):
+            raise ValueError("Impossibile interpretare l'ordinamento dei parametri p.")
+        pars = cand
+
+    kappa, theta, v0, xi, rho, gamma, lambda_S, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V = pars
+
+    fair = bool(globals().get("FAIR_COMPARE", False))
+    alpha_eff = 1.0 if fair else float(alpha)
+
+    S_T, v_T = sfv_qe_kou_paths(S0=S, T=T, r=r, q=q, kappa=kappa, theta=theta, v0=v0, xi=xi, rho=rho, gamma=gamma, lambda_S=lambda_S, p_up=p_up, eta1=eta1, eta2=eta2, lambda_V=lambda_V, mu_J_V=mu_J_V, sigma_J_V=sigma_J_V, N=N_step, M=M, rng=rng)
+
+    payoffs = np.maximum(S_T[:, None] - strikes[None, :], 0.0)
+    model_prices = np.exp(-r * T) * payoffs.mean(axis=0)
+
+    if fair:
+        w = np.ones_like(strikes, dtype=float)
+    else:
+        if w_pre is not None:
+            w = np.asarray(w_pre, dtype=float)
+        else:
+            if iv_mkt is None:
+                iv_mkt = np.array([np.clip(bs_implied_vol_from_price(m, S, K, T, r, q), vols_bounds[0], vols_bounds[1]) for K, m in zip(strikes, market_mid)])
+            vegas = np.array([bs_vega(S, K, T, r, q, iv) if np.isfinite(iv) and (vols_bounds[0] < iv < vols_bounds[1]) else 0.0 for K, iv in zip(strikes, iv_mkt)])
+            w_vega = 1.0 / (vegas + 1e-8)
+            if liq_weights is None:
+                w_liq = np.ones_like(w_vega)
+            else:
+                w_liq = np.asarray(liq_weights, dtype=float)
+                w_liq = w_liq / (w_liq.mean() + 1e-12)
+            w = w_vega * w_liq
+
+    err_p = model_prices - market_mid
+    mse_price = (w * err_p * err_p).mean()
+
+    mse_iv = 0.0
+    if alpha_eff < 1.0:
+        iv_model = np.array([np.clip(bs_implied_vol_from_price(px, S, K, T, r, q), vols_bounds[0], vols_bounds[1]) for K, px in zip(strikes, model_prices)])
+        if iv_mkt is None:
+            iv_mkt = np.array([np.clip(bs_implied_vol_from_price(m, S, K, T, r, q), vols_bounds[0], vols_bounds[1]) for K, m in zip(strikes, market_mid)])
+        diff_iv = iv_model - iv_mkt
+        mse_iv = (diff_iv * diff_iv).mean()
+
+    reg = 0.0                            #sezione di regolarizzazione (opzionale)
+    if isinstance(reg_weights, dict):
+        reg += float(reg_weights.get("w_gamma",   0.0)) * (gamma    * gamma)
+        reg += float(reg_weights.get("w_lambdaS", 0.0)) * (lambda_S * lambda_S)
+        reg += float(reg_weights.get("w_lambdaV", 0.0)) * (lambda_V * lambda_V)
+
+    loss = alpha_eff * mse_price + (1.0 - alpha_eff) * mse_iv + reg
+    return float(loss)
+
+
+def _prep_dataset_for_expiry(ticker_api, expiry_str, S0, r, q, min_selected=6, n_strikes=8, today=None, opt_type='Call'):  # <- aggiunto
+    if today is None:        #debug aggiuntivo (14/8)
+        today = pd.Timestamp.today()
+    expiry = pd.to_datetime(expiry_str)
+    T = calculate_time_to_maturity(expiry, today)
+
+    diag = build_option_diagnostics(ticker_api, expiry_str, S0, T, r, q, opt_type=opt_type)
+    use = diag[diag['selected']].copy()
+    if len(use) < min_selected:
+        tmp = diag.copy()
+        tmp['dist'] = (tmp['strike'] - S0).abs()
+        use = tmp.sort_values('dist').head(max(min_selected, n_strikes)).copy()
+
+    use = use[['strike','mid','impliedVolatility','openInterest','volume']].dropna(subset=['strike','mid'])
+    if use.empty:
+        raise RuntimeError(f"Nessun dato utile per expiry {expiry_str}")
+
+    strikes = use['strike'].to_numpy(dtype=float)
+    market_mid = use['mid'].to_numpy(dtype=float)
+
+    iv_mkt = use['impliedVolatility'].to_numpy(dtype=float)
+    iv_clean = []
+    for K, m, iv in zip(strikes, market_mid, iv_mkt):
+        if not (np.isfinite(iv) and iv > 1e-6):
+            iv = bs_implied_vol_from_price(m, S0, K, T, r, q)
+        iv_clean.append(iv)
+    iv_mkt = np.array(iv_clean, dtype=float)
+
+    vegas = np.array([bs_vega(S0, K, T, r, q, iv) if (np.isfinite(iv) and 1e-6 < iv < 3.0) else 0.0 for K, iv in zip(strikes, iv_mkt)])
+    w_vega = 1.0 / (vegas + 1e-6)
+    liq = np.sqrt(use['openInterest'].fillna(0).to_numpy() + use['volume'].fillna(0).to_numpy() + 1.0)
+    w_liq = liq / (liq.mean() + 1e-12)
+    w_pre = w_vega * w_liq
+
+    N_step = max(10, int(np.ceil(T * 252 / 2)))  # ~2 giorni di borsa per step, minimo 10
+    M_suggest = 6000 if T <= 30/365 else 9000
+
+    return {'expiry': expiry_str, 'T': T, 'strikes': strikes, 'market_mid': market_mid, 'w_pre': w_pre, 'iv_mkt': iv_mkt, 'N_step': N_step, 'M': M_suggest}
+
+def _obj_sfv_multi(p, datasets, S0, r, q, alpha=1.0, seed=42, scale_by=1.0):
+    losses = []
+    for i, d in enumerate(datasets):
+        rng_i = np.random.default_rng(seed + i)
+        loss = obj_sfv_jump_qe(p, S0, r, q, d['T'], d['strikes'], d['market_mid'], iv_mkt=d['iv_mkt'], w_pre=d['w_pre'], liq_weights=None, vols_bounds=(1e-6, 3.0), N_step=d['N_step'], M=d['M'], alpha=alpha, rng=rng_i, reg_weights={'w_gamma':0.01, 'w_lambdaS':0.01, 'w_lambdaV':0.01})
+        losses.append(loss)
+    return float(np.mean(losses)) / float(scale_by)
+
+def _rmse_sfv_on_dataset(p, data, S0, r, q, seed=777):
+    (kappa, theta, v0, xi, gamma, lambda_S, p_up_S, eta1_S, eta2_S, lambda_V, mu_J_V, sigma_J_V, rho) = p
+    T = data['T']; strikes = data['strikes']; mkt = data['market_mid']
+    rng = np.random.default_rng(seed)
+    S_T, _ = sfv_qe_kou_paths(S0, T, r, q, kappa, theta, v0, xi, rho, gamma, lambda_S, p_up_S, eta1_S, eta2_S, lambda_V, mu_J_V, sigma_J_V, N=data['N_step'], M=max(9000, data['M']), rng=rng)
+    prices = np.exp(-r*T) * np.maximum(S_T[:, None] - strikes[None, :], 0.0).mean(axis=0)
+    return float(np.sqrt(np.mean((prices - mkt)**2)))
+
+def obj_heston_jump(p, S, strikes, market_prices, T, r, q=0.0):
+    kappa, theta, v0, xi, rho, lambda_jump, mu_J, sigma_J = p
+    sims = []
+    for K in strikes:
+        price = heston_monte_carlo_jump(S, K, T, r, kappa, theta, v0, rho, xi, option_type='call', simulations=2000, steps=15, lambda_jump=lambda_jump, mu_J=mu_J, sigma_J=sigma_J, q=q)
+        sims.append(price)
+    return float(np.sum((np.array(sims) - market_prices) ** 2))
+
+def heston_mc_jump_ST(S0, T, r, kappa, theta, v0, rho, xi,lambda_jump=0.1, mu_J=-0.1, sigma_J=0.2, q=0.0, simulations=6000, steps=15, seed=42):
+    rng = np.random.default_rng(seed)
+    dt = T / steps
+    S = np.full(simulations, float(S0))
+    v = np.full(simulations, float(v0))
+    EJ = np.exp(mu_J + 0.5 * sigma_J**2)
+    drift_jump_comp = lambda_jump * (EJ - 1.0)
+    L = np.array([[1.0, 0.0], [rho, np.sqrt(max(1.0 - rho**2, 0.0))]])
+    for _ in range(steps):
+        Z = rng.standard_normal((2, simulations))
+        dW1, dW2 = L @ Z
+        v_prev = np.maximum(v, 0.0)
+        N_jump = rng.poisson(lambda_jump * dt, size=simulations)
+        J_sum = np.zeros(simulations)
+        m = N_jump > 0
+        if m.any():
+            J_sum[m] = rng.normal(loc=N_jump[m]*mu_J, scale=np.sqrt(N_jump[m])*sigma_J)
+        jump_factor = np.exp(J_sum)
+        drift = (r - q - drift_jump_comp - 0.5 * v_prev) * dt
+        v = np.maximum(v_prev + kappa*(theta - v_prev)*dt + xi*np.sqrt(np.maximum(v_prev, 0.0)*dt)*dW2, 0.0)
+        S = S * np.exp(drift + np.sqrt(np.maximum(v_prev, 0.0)*dt)*dW1) * jump_factor
+    return S
+
+def heston_price_vectorized(S0, strikes, T, r, kappa, theta, v0, rho, xi, lambda_jump, mu_J, sigma_J, q=0.0, simulations=6000, steps=15, seed=42):
+    ST = heston_mc_jump_ST(S0, T, r, kappa, theta, v0, rho, xi, lambda_jump, mu_J, sigma_J, q, simulations, steps, seed)
+    payoffs = np.maximum(ST[:, None] - strikes[None, :], 0.0)
+    return np.exp(-r * T) * payoffs.mean(axis=0)
+
+def obj_heston_jump_vec(p, S, strikes, market_prices, T, r, q=0.0, M=6000, steps=15, seed=42):
+    kappa, theta, v0, xi, rho, lambda_jump, mu_J, sigma_J = p
+    model = heston_price_vectorized(S, strikes, T, r, kappa, theta, v0, rho, xi, lambda_jump, mu_J, sigma_J, q, simulations=M, steps=steps, seed=seed)
+    return float(np.sum((model - market_prices) ** 2))
+
+def calibrate_heston_jump_by_data(S, strikes, market_prices, Ttm, r, q=0.0, dev=False, dev_logger=None):
+    bounds = [(0.1, 10), (1e-3, 1), (1e-3, 1), (1e-3, 2), (-0.95, 0.95), (0, 5), (-1, 1), (1e-3, 1)]
+    rec_coarse = ObjectiveRecorder(lambda x, *a: obj_heston_jump_vec(x, *a))
+    rec_fine   = ObjectiveRecorder(lambda x, *a: obj_heston_jump_vec(x, *a))
+
+    args_coarse = (S, strikes, market_prices, Ttm, r, q, 4000, 15, 11)
+    args_fine   = (S, strikes, market_prices, Ttm, r, q, 9000, 15, 23)
+
+    it_de = {"k": 0}
+    def _cb_de(xk, conv):
+        it_de["k"] += 1
+        if dev and dev_logger is not None and rec_coarse.last_f is not None:
+            dev_logger.write(f"[Heston] differential_evolution step {it_de['k']}: f(x)= {rec_coarse.last_f:.6g}")
+        return False
+
+    de_res = differential_evolution(rec_coarse, bounds, args=args_coarse, maxiter=(30 if dev else 50), popsize=(10 if dev else 16), polish=False, disp=False, callback=_cb_de)
+    x_start = np.array(de_res.x, dtype=float)
+
+    it_lb = {"k": 0}
+    def _cb_lb(xk):
+        it_lb["k"] += 1
+        if dev and dev_logger is not None and rec_fine.last_f is not None:
+            dev_logger.write(f"[Heston] L-BFGS-B iter {it_lb['k']}: f(x)= {rec_fine.last_f:.6g}")
+
+    res_lb = minimize(rec_fine, x0=x_start, args=args_fine, bounds=bounds, method='L-BFGS-B', options={'maxiter': 100, 'disp': False, 'maxls': 50, 'ftol': 1e-8, 'gtol': 1e-5, 'eps': 1e-8}, callback=_cb_lb)
+
+    if not (res_lb.success and np.all(np.isfinite(res_lb.x))):
+        if dev and dev_logger is not None:
+            dev_logger.write(f"[Heston] L-BFGS-B non riuscito ({getattr(res_lb,'message','n/a')}). Avvio Powell…")           #backstop (test 13/8)
+        it_pw = {"k": 0}
+        def _cb_pw(xk):
+            it_pw["k"] += 1
+            if dev and dev_logger is not None and rec_fine.last_f is not None:
+                dev_logger.write(f"[Heston] Powell iter {it_pw['k']}: f(x)= {rec_fine.last_f:.6g}")
+        res_pw = minimize(rec_fine, x0=x_start, args=args_fine, bounds=bounds, method='Powell', options={'maxiter': 180, 'disp': False}, callback=_cb_pw)
+
+        def _val(x): return float(rec_fine(np.array(x, float), *args_fine))
+        cand = []
+        try: cand.append(('DE', x_start, _val(x_start)))
+        except: pass
+        if res_lb.success and np.all(np.isfinite(res_lb.x)):
+            try: cand.append(('LBFGS', res_lb.x, _val(res_lb.x)))
+            except: pass
+        if res_pw.success and np.all(np.isfinite(res_pw.x)):
+            try: cand.append(('POWELL', res_pw.x, _val(res_pw.x)))
+            except: pass
+        if not cand:
+            raise RuntimeError("Ottimizzazione Heston non riuscita: nessuna soluzione valida.")
+        best_name, best_x, best_f = min(cand, key=lambda t: t[2])
+        if dev and dev_logger is not None:
+            dev_logger.write(f"[Heston] Selezionata soluzione {best_name} con f(x)= {best_f:.6g}")
+        return best_x
+
+    return res_lb.x
+
+def calibrate_heston_jump(ticker, maturity, r, q=0.0, dev=False, dev_stream=None, dev_logger=None):
+    S = get_spot_price(ticker)
+    maturity_str = maturity.strftime('%Y-%m-%d')
+
+    oc_calls = yf.Ticker(ticker).option_chain(maturity_str).calls
+    if oc_calls is None or len(oc_calls) == 0:
+        raise RuntimeError("Option chain vuota per la scadenza richiesta.")
+    oc = oc_calls[['strike','lastPrice']].dropna().copy()
+    oc = oc[oc['lastPrice'] > 0]
+    near = oc[oc['strike'].between(0.9*S, 1.1*S)].copy()
+    if near.empty:
+        oc['dist'] = (oc['strike'] - S).abs()
+        sel = oc.sort_values('dist').head(8)
+    else:
+        near['dist'] = (near['strike'] - S).abs()
+        sel = near.sort_values('dist').head(8)
+
+    strikes = sel['strike'].values.astype(float)
+    market_prices = sel['lastPrice'].values.astype(float)
+    if strikes.size < 3:
+        raise RuntimeError(f"Troppi pochi strike utili ({strikes.size}).")
+
+    Ttm = calculate_time_to_maturity(maturity)
+    bounds = [(0.1, 10), (1e-3, 1), (1e-3, 1), (1e-3, 2), (-0.95, 0.95), (0, 5), (-1, 1), (1e-3, 1)] #rispettivamente kappa-theta-v0-xi-lambda-mu-sigma (che includono la componente jump)
+    recorder_coarse = ObjectiveRecorder(obj_heston_jump)
+    recorder_fine   = ObjectiveRecorder(obj_heston_jump)
+
+    it_de = {"k": 0}      #stadio 1 della calibrazione: Differential Evolution (aggiornamento 14/8)
+    def _cb_de(xk, conv):
+        it_de["k"] += 1
+        if dev and dev_logger is not None and recorder_coarse.last_f is not None:
+            dev_logger.write(f"[Heston] differential_evolution step {it_de['k']}: f(x)= {recorder_coarse.last_f:.6g}")
+        return False
+
+    de_opts = dict(maxiter=(40 if dev else 60), popsize=(12 if dev else 18))
+    de_res = differential_evolution(
+        recorder_coarse, bounds,
+        args=(S, strikes, market_prices, Ttm, r, q),
+        polish=False,              # niente L-BFGS-B implicito
+        disp=False, callback=_cb_de, **de_opts
+    )
+    x_start = np.array(de_res.x, dtype=float)
+
+    it_lbfgs = {"k": 0}       #stadio 2 della calibrazione: L-BFGS-B con miglioramento della line-search
+    def _cb_lbfgs(xk):
+        it_lbfgs["k"] += 1
+        if dev and dev_logger is not None and recorder_fine.last_f is not None:
+            dev_logger.write(f"[Heston] L-BFGS-B iter {it_lbfgs['k']}: f(x)= {recorder_fine.last_f:.6g}")
+
+    lbfgs_opts = {'maxiter': 120, 'disp': False, 'maxls': 60, 'ftol': 1e-8, 'gtol': 1e-5, 'eps': 1e-8}
+    res_lbfgs = minimize(recorder_fine, x0=x_start, args=(S, strikes, market_prices, Ttm, r, q), bounds=bounds, method='L-BFGS-B', options=lbfgs_opts, callback=_cb_lbfgs)
+
+    if not (res_lbfgs.success and np.all(np.isfinite(res_lbfgs.x))):
+        if dev and dev_logger is not None:
+            dev_logger.write(f"[Heston] L-BFGS-B non riuscito ({getattr(res_lbfgs, 'message','n/a')}). Avvio Powell…")
+
+        it_pow = {"k": 0}
+        def _cb_powell(xk):
+            it_pow["k"] += 1
+            if dev and dev_logger is not None and recorder_fine.last_f is not None:
+                dev_logger.write(f"[Heston] Powell iter {it_pow['k']}: f(x)= {recorder_fine.last_f:.6g}")
+
+        res_pow = minimize(recorder_fine, x0=x_start, args=(S, strikes, market_prices, Ttm, r, q), bounds=bounds, method='Powell', options={'maxiter': 200, 'disp': False}, callback=_cb_powell)
+        def _val(x):
+            return float(recorder_fine(np.array(x, dtype=float), S, strikes, market_prices, Ttm, r, q))
+
+        candidates = []
+        try: candidates.append(('DE', x_start, _val(x_start)))
+        except Exception: pass
+        if res_lbfgs.success and np.all(np.isfinite(res_lbfgs.x)):
+            try: candidates.append(('LBFGS', res_lbfgs.x, _val(res_lbfgs.x)))
+            except Exception: pass
+        if res_pow.success and np.all(np.isfinite(res_pow.x)):
+            try: candidates.append(('POWELL', res_pow.x, _val(res_pow.x)))
+            except Exception: pass
+
+        if not candidates:
+            raise RuntimeError("Ottimizzazione Heston non riuscita: nessuna soluzione valida.")
+
+        best_name, best_x, best_f = min(candidates, key=lambda t: t[2])
+        if dev and dev_logger is not None:
+            dev_logger.write(f"[Heston] Selezionata soluzione {best_name} con f(x)= {best_f:.6g}")
+        return best_x
+
+    return res_lbfgs.x
+
+def calibrate_sfv_jump(ticker, maturity, r, q=0.0, method='differential_evolution', n_strikes=8, dev=False, dev_stream=None, N_step=None, dev_logger=None):
+    maturity_str = maturity.strftime('%Y-%m-%d')
+    S = get_spot_price(ticker)
+    Ttm = calculate_time_to_maturity(maturity)
+    tkr = yf.Ticker(ticker)
+    oc_all = tkr.option_chain(maturity_str).calls
+    if oc_all is None or len(oc_all) == 0:
+        raise RuntimeError("Option chain vuota per la scadenza richiesta.")
+
+    oc = oc_all[['strike', 'lastPrice']].dropna().copy()
+    oc = oc[oc['lastPrice'] > 0]
+
+    oc_band = oc[oc['strike'].between(0.9 * S, 1.1 * S)].copy()
+    if oc_band.empty:
+        oc['dist'] = (oc['strike'] - S).abs()
+        oc_sel = oc.sort_values('dist').head(max(5, n_strikes)).copy()
+    else:
+        oc_band['dist'] = (oc_band['strike'] - S).abs()
+        oc_sel = oc_band.sort_values('dist').head(n_strikes).copy()
+
+    strikes = oc_sel['strike'].values.astype(float)
+    market_prices = oc_sel['lastPrice'].values.astype(float)
+    if strikes.size < 3:
+        raise RuntimeError(f"Troppi pochi strike utili ({strikes.size}).")
+
+    try:
+        oc_liq = oc_all[['strike', 'openInterest', 'volume']].dropna(subset=['strike'])
+        oc_liq = oc_liq[oc_liq['strike'].isin(strikes)].set_index('strike').reindex(strikes)
+        liq_weights = np.sqrt(oc_liq['openInterest'].fillna(0).values + oc_liq['volume'].fillna(0).values + 1.0)
+    except Exception:
+        liq_weights = np.ones_like(strikes, dtype=float)
+
+    iv_mkt = np.array([bs_implied_vol_from_price(m, S, K, Ttm, r, q) for K, m in zip(strikes, market_prices)])
+    vegas = np.array([bs_vega(S, K, Ttm, r, q, iv) if (np.isfinite(iv) and 1e-6 < iv < 3.0) else 0.0 for K, iv in zip(strikes, iv_mkt)])
+    w_vega = 1.0 / (vegas + 1e-6)
+    w_liq = liq_weights / (liq_weights.mean() + 1e-12)
+    w_pre = w_vega * w_liq  # passato all'objective
+
+    bounds = [(0.1, 10), (1e-3, 1), (1e-3, 1), (1e-3, 2), (-3.5, 3.5), (0.0, 5.0), (0.01, 0.99), (1.05, 10.0), (0.05, 10.0), (0.0, 5.0), (-1.0, 1.0), (1e-3, 1.0), (-0.95, 0.95)]
+
+    if N_step is None:
+        N_step = max(10, int(np.ceil(Ttm * 252 / 2)))  # ~2 giorni di borsa/step, min 10
+    M_coarse = 6000 if Ttm <= 30/365 else 9000
+    M_fine = 12000 if Ttm <= 30/365 else 16000
+    if dev:
+        M_coarse = max(4000, int(0.7 * M_coarse))
+        M_fine = max(8000, int(0.8 * M_fine))
+
+    rec_coarse = ObjectiveRecorder(obj_sfv_jump_qe)
+    rec_fine = ObjectiveRecorder(obj_sfv_jump_qe)
+
+    reg_coarse = {'w_gamma': 0.01, 'w_lambdaS': 0.01, 'w_lambdaV': 0.01}
+    reg_fine = {'w_gamma': 0.01, 'w_lambdaS': 0.01, 'w_lambdaV': 0.01}
+
+    args_coarse = (S, r, q, Ttm, strikes, market_prices, iv_mkt, w_pre, liq_weights, (1e-6, 3.0), N_step, M_coarse, 1.0, None, reg_coarse)
+    args_fine = (S, r, q, Ttm, strikes, market_prices, iv_mkt, w_pre, liq_weights, (1e-6, 3.0), N_step, M_fine, 1.0, None, reg_fine)
+
+    it_de = {"k": 0}       #stadio 1 della calibrazione: Differential Evolution con Common Random Numbers
+    def _cb_de(xk, conv):
+        it_de["k"] += 1
+        if dev and dev_logger is not None and rec_coarse.last_f is not None:
+            dev_logger.write(f"[SFV] differential_evolution step {it_de['k']}: f(x)= {rec_coarse.last_f:.6g}")
+        return False
+
+    crn_map = CRNMap(base_seed=42)
+    de_res = differential_evolution(rec_coarse, bounds, args=args_coarse, maxiter=(40 if dev else 60), popsize=(12 if dev else 18), mutation=(0.6, 1.0), recombination=0.9, polish=False, disp=False, callback=_cb_de, updating='deferred', workers=crn_map, seed=42)
+    x_start = np.array(de_res.x, dtype=float)
+
+    it_lbfgs = {"k": 0}     #stadio 2 della calibrazone: L-BFGS-B (con Powell)
+    def _cb_lbfgs(xk):
+        it_lbfgs["k"] += 1
+        if dev and dev_logger is not None and rec_fine.last_f is not None:
+            dev_logger.write(f"[SFV] L-BFGS-B iter {it_lbfgs['k']}: f(x)= {rec_fine.last_f:.6g}")
+
+    lbfgs_opts = {'maxiter': 120, 'disp': False, 'maxls': 60, 'ftol': 1e-6, 'gtol': 1e-5, 'eps': 1e-8}
+    res_lbfgs = minimize(rec_fine, x0=x_start, args=args_fine, bounds=bounds, method='L-BFGS-B', options=lbfgs_opts, callback=_cb_lbfgs)
+
+    if not (res_lbfgs.success and np.all(np.isfinite(res_lbfgs.x))):
+        if dev and dev_logger is not None:
+            dev_logger.write(f"[SFV] L-BFGS-B non riuscito ({getattr(res_lbfgs, 'message', 'n/a')}). Avvio Powell…")
+
+        it_pow = {"k": 0}
+        def _cb_powell(xk):
+            it_pow["k"] += 1
+            if dev and dev_logger is not None and rec_fine.last_f is not None:
+                dev_logger.write(f"[SFV] Powell iter {it_pow['k']}: f(x)= {rec_fine.last_f:.6g}")
+
+        res_pow = minimize(rec_fine, x0=x_start, args=args_fine, bounds=bounds, method='Powell', options={'maxiter': 200, 'disp': False}, callback=_cb_powell)
+
+        def _val(x):
+            return float(rec_fine(np.array(x, dtype=float), *args_fine))
+
+        candidates = []
+        try: candidates.append(('DE', x_start, _val(x_start)))
+        except Exception: pass
+        if res_lbfgs.success and np.all(np.isfinite(res_lbfgs.x)):
+            try: candidates.append(('LBFGS', res_lbfgs.x, _val(res_lbfgs.x)))
+            except Exception: pass
+        if res_pow.success and np.all(np.isfinite(res_pow.x)):
+            try: candidates.append(('POWELL', res_pow.x, _val(res_pow.x)))
+            except Exception: pass
+
+        if not candidates:
+            raise RuntimeError("Ottimizzazione SFV non riuscita: nessuna soluzione valida.")
+
+        best_name, best_x, best_f = min(candidates, key=lambda t: t[2])
+        if dev and dev_logger is not None:
+            dev_logger.write(f"[SFV] Selezionata soluzione {best_name} con f(x)= {best_f:.6g}")
+        return best_x
+        
+    return res_lbfgs.x
+    
+def calibrate_sfv_multi_expiry(datasets, S0, r, q, dev=False, dev_logger=None):      #OOS Analysis
+    bounds = [(0.1, 10), (1e-3, 1), (1e-3, 1), (1e-3, 2), (-3.5, 3.5), (0.0, 5.0), (0.01, 0.99), (1.05, 10.0), (0.05, 10.0), (0.0, 5.0), (-1.0, 1.0), (1e-3, 1.0), (-0.95, 0.95)]
+
+    rec_coarse = ObjectiveRecorder(lambda x: _obj_sfv_multi(x, datasets, S0, r, q, alpha=1.0, seed=777))
+    rec_fine   = ObjectiveRecorder(lambda x: _obj_sfv_multi(x, datasets, S0, r, q, alpha=1.0, seed=1234))
+
+    it_de = {'k': 0}
+    def _cb_de(xk, conv):
+        it_de['k'] += 1
+        if dev and dev_logger is not None and rec_coarse.last_f is not None:
+            dev_logger.write(f"[SFV-OOS] DE step {it_de['k']}: f(x)= {rec_coarse.last_f:.6g}")
+        return False
+
+    crn_map = CRNMap(base_seed=777) 
+    de_res = differential_evolution(rec_coarse, bounds, maxiter=(30 if dev else 50), popsize=(10 if dev else 16), mutation=(0.6, 1.0), recombination=0.9, polish=False, disp=False, callback=_cb_de, updating='deferred', workers=crn_map, seed=777)
+
+    x_start = np.array(de_res.x, dtype=float)
+
+    it_lb = {'k': 0}
+    def _cb_lb(xk):
+        it_lb['k'] += 1
+        if dev and dev_logger is not None and rec_fine.last_f is not None:
+            dev_logger.write(f"[SFV-OOS] LBFGS iter {it_lb['k']}: f(x)= {rec_fine.last_f:.6g}")
+
+    res_lb = minimize(
+        rec_fine, x0=x_start, bounds=bounds, method='L-BFGS-B',
+        options={'maxiter': 100, 'disp': False, 'maxls': 50, 'ftol': 1e-6, 'gtol': 1e-5, 'eps': 1e-8}, callback=_cb_lb)
+
+    if not (res_lb.success and np.all(np.isfinite(res_lb.x))):
+        if dev and dev_logger is not None:
+            dev_logger.write(f"[SFV-OOS] LBFGS fallito ({getattr(res_lb, 'message','n/a')}). Powell…")
+
+        res_pw = minimize(
+            rec_fine, x0=x_start, bounds=bounds, method='Powell', options={'maxiter': 160, 'disp': False})
+
+        # Seleziona la migliore soluzione valida tra DE start, LBFGS (se valido), Powell (se valido)
+        def _val(x):
+            return float(rec_fine(np.array(x, dtype=float)))
+
+        candidates = []
+        try: candidates.append(('DE', x_start, _val(x_start)))
+        except Exception: pass
+        if res_lb.success and np.all(np.isfinite(res_lb.x)):
+            try: candidates.append(('LBFGS', res_lb.x, _val(res_lb.x)))
+            except Exception: pass
+        if res_pw.success and np.all(np.isfinite(res_pw.x)):
+            try: candidates.append(('POWELL', res_pw.x, _val(res_pw.x)))
+            except Exception: pass
+
+        if not candidates:
+            raise RuntimeError("SFV-OOS: nessuna soluzione valida.")
+        return min(candidates, key=lambda t: t[2])[1]
+
+    return res_lb.x
+
+def sfv_oos_leave_one_expiry_out(ticker, expiries, r, q, min_selected=6, n_train_cap=3, dev=False, dev_logger=None):
+    tkr = yf.Ticker(ticker)
+    S0  = get_spot_price(ticker)
+    today = pd.Timestamp.today()
+
+    panels = []
+    for exp in expiries:
+        try:
+            ds = _prep_dataset_for_expiry(tkr, exp, S0, r, q, min_selected=min_selected, today=today)
+            panels.append(ds)
+        except Exception:
+            continue
+    panels.sort(key=lambda d: d['T'])
+    if len(panels) < 2:
+        raise RuntimeError("Troppo poche expiry utilizzabili per OOS.")
+
+    results = []
+    for i, test in enumerate(panels):
+        train = panels[max(0, i - n_train_cap):i]
+        if not train:
+            train = panels[i+1:i+1+n_train_cap]
+        if not train:
+            continue
+
+        if dev and dev_logger is not None:
+            dev_logger.write(f"[OOS] Test expiry={test['expiry']} (T={test['T']:.3f}y), train={ [d['expiry'] for d in train] }")
+
+        x = calibrate_sfv_multi_expiry(train, S0, r, q, dev=dev, dev_logger=dev_logger)
+        rmse_test = _rmse_sfv_on_dataset(x, test, S0, r, q, seed=999)
+        rmse_tr = np.mean([_rmse_sfv_on_dataset(x, d, S0, r, q, seed=123+i) for i,d in enumerate(train)])
+
+        results.append({'test_expiry': test['expiry'], 'T_test': test['T'], 'train_expiries': [d['expiry'] for d in train], 'RMSE_train_avg': rmse_tr, 'RMSE_test': rmse_test})
+    return pd.DataFrame(results).sort_values('T_test').reset_index(drop=True)
+
+def build_option_diagnostics(ticker_api, expiry_str, S0, T, r, q, opt_type='Call'):
+    opt = ticker_api.option_chain(expiry_str)
+    oc = (opt.calls if opt_type == 'Call' else opt.puts).copy()
+    keep = ['contractSymbol','strike','lastPrice','bid','ask', 'impliedVolatility','volume','openInterest']
+    for c in keep:
+        if c not in oc.columns: oc[c] = np.nan
+    oc = oc[keep].dropna(subset=['strike','bid','ask']).copy()
+
+    oc['mid'] = 0.5*(oc['bid'] + oc['ask'])
+    oc['spread_pct'] = (oc['ask'] - oc['bid'])/oc['mid'].replace(0, np.nan)
+    if opt_type == 'Call':
+        oc['intrinsic'] = np.maximum(S0*np.exp(-q*T) - oc['strike']*np.exp(-r*T), 0.0)        #intrinsic value
+        price_upper = PRICE_MAX_MULT * S0
+    else:
+        oc['intrinsic']  = np.maximum(oc['strike']*np.exp(-r*T) - S0*np.exp(-q*T), 0.0)
+        price_upper = np.minimum(PRICE_MAX_MULT * S0, oc['strike']*np.exp(-r*T))
+
+    oc['near_spot'] = oc['strike'].between(NEAR_SPOT_LOW*S0, NEAR_SPOT_HIGH*S0)
+    oc['spread_ok'] = oc['spread_pct'] < MAX_SPREAD_PCT
+    oc['iv_ok'] = (oc['impliedVolatility'] > IV_MIN) & (oc['impliedVolatility'] < IV_MAX)
+    oc['price_ok'] = (oc['mid'] >= oc['intrinsic']) & (oc['mid'] <= price_upper)
+
+    if REQUIRE_LIQUID:
+        liq_ok = (oc['openInterest'] > 0) | (oc['volume'] > 0)
+        oc['selected'] = oc['near_spot'] & oc['spread_ok'] & oc['iv_ok'] & oc['price_ok'] & liq_ok
+    else:
+        oc['selected'] = oc['near_spot'] & oc['spread_ok'] & oc['iv_ok'] & oc['price_ok']
+    return oc.sort_values('strike').reset_index(drop=True)
+
+
+def make_price_wrappers(S0, T, q, params_heston, params_sfv, sims_heston, sims_mc_bs, N_sfv=None,opt_type='Call'):
+    option_type = opt_type.lower()
+    kappa_h, theta_h, v0_h, xi_h, rho_h, lambda_h, muJ_h, sigmaJ_h = params_heston
+    (kappa_sfv, theta_sfv, v0_sfv, xi_sfv, gamma_sfv, lambda_S_sfv, p_up_S_sfv, eta1_S_sfv, eta2_S_sfv, lambda_V_sfv, mu_J_V_sfv, sigma_J_V_sfv, rho_sfv) = params_sfv
+    N_eff = max(10, int(np.ceil(252 * T / 2.0))) if N_sfv is None else int(max(10, N_sfv))
+
+    def price_bs(K, iv):
+        return black_scholes_price(S0, K, T, RISK_FREE_RATE, q, iv, option_type)
+
+    def price_crr(K, iv):
+        return crr_binomial_price(S0, K, T, RISK_FREE_RATE, q, iv, N=2000, option_type=option_type)
+
+    def price_mc_bs(K, iv):
+        return monte_carlo_antithetic_control(S0, K, T, RISK_FREE_RATE, iv, simulations=int(sims_mc_bs), steps=1, option_type=option_type, q=q)
+
+    def price_heston(K, iv_unused=None):
+        return heston_monte_carlo_jump(S0, K, T, RISK_FREE_RATE, kappa_h, theta_h, v0_h, rho_h, xi_h, option_type=option_type, simulations=int(sims_heston), steps=15, lambda_jump=lambda_h, mu_J=muJ_h, sigma_J=sigmaJ_h, q=q)
+
+    def price_sfv(K, iv_unused=None):
+        M = int(np.clip(sims_heston, 5000, 40000))
+        if option_type == 'call':
+            return price_call_option_qe_kou(S0, v0_sfv, K, T, RISK_FREE_RATE, q, kappa=kappa_sfv, theta=theta_sfv, xi=xi_sfv, gamma=gamma_sfv, lambda_S=lambda_S_sfv, p_up_S=p_up_S_sfv, eta1_S=eta1_S_sfv, eta2_S=eta2_S_sfv, lambda_V=lambda_V_sfv, mu_J_V=mu_J_V_sfv, sigma_J_V=sigma_J_V_sfv, rho=rho_sfv, M=M, N=N_eff, seed=42)
+        else:
+            return price_put_option_qe_kou(S0, v0_sfv, K, T, RISK_FREE_RATE, q, kappa=kappa_sfv, theta=theta_sfv, xi=xi_sfv, gamma=gamma_sfv, lambda_S=lambda_S_sfv, p_up_S=p_up_S_sfv, eta1_S=eta1_S_sfv, eta2_S=eta2_S_sfv, lambda_V=lambda_V_sfv, mu_J_V=mu_J_V_sfv, sigma_J_V=sigma_J_V_sfv, rho=rho_sfv, M=M, N=N_eff, seed=42)
+
+    return price_heston, price_sfv, price_bs, price_crr, price_mc_bs
+
+def build_results_table(rows_df, S0, T, q, price_funcs, opt_type='Call'):
+    price_heston, price_sfv, price_bs, price_crr, price_mc_bs = price_funcs
+    is_call = (opt_type == 'Call')
+    r = RISK_FREE_RATE  # usa la tua costante globale
+
+    rows = []
+    for _, rr in rows_df.iterrows():
+        K = float(rr['strike'])
+        Mkt = float(rr['mid'])
+
+        if is_call:
+            intrinsic = max(S0 * np.exp(-q*T) - K * np.exp(-r*T), 0.0)
+        else:
+            intrinsic = max(K * np.exp(-r*T) - S0 * np.exp(-q*T), 0.0)
+
+        iv = rr.get('impliedVolatility', np.nan)
+        if not (np.isfinite(iv) and iv > 1e-6):
+            iv = bs_implied_vol_from_price(Mkt, S0, K, T, r, q, option_type=('call' if is_call else 'put'))
+
+        hP = price_heston(K, iv)  # non usa IV internamente (placeholder compatibile)
+        sfvP = price_sfv(K, iv)
+
+        # Modelli che richiedono sigma: calcola solo se IV è valida
+        if np.isfinite(iv) and iv > 1e-6:
+            bsP = price_bs(K, iv)
+            crrP = price_crr(K, iv)
+            mcP = price_mc_bs(K, iv)
+        else:
+            bsP = crrP = mcP = np.nan
+
+        rows.append([K, T, Mkt, hP, sfvP, bsP, crrP, mcP, (hP - Mkt)**2 if np.isfinite(hP) else np.nan, (sfvP - Mkt)**2 if np.isfinite(sfvP) else np.nan, (bsP - Mkt)**2 if np.isfinite(bsP) else np.nan, (crrP - Mkt)**2 if np.isfinite(crrP) else np.nan, (mcP - Mkt)**2 if np.isfinite(mcP) else np.nan, iv, intrinsic])
+
+    return pd.DataFrame(rows, columns=['K','T','Market','Heston','SFV','BS','CRR','MC_BS','SQError_Heston','SQError_SFV','SQError_BS','SQError_CRR','SQError_MC_BS','IV','Intrinsic']).sort_values('K').reset_index(drop=True)
+
+def rmse_from(df, col):
+    colser = df[col]
+    return float(np.sqrt(colser.mean())) if colser.notna().any() else np.nan
+
+def style_with_blue(df, caption_text):
+    blue_header = [{'selector': 'thead th', 'props': [('background-color', '#1f497d'), ('color', 'white')]}]
+    blue_rows = [{'selector': 'tbody tr:nth-child(odd)',  'props': [('background-color', '#e8f1fb')]}, {'selector': 'tbody tr:nth-child(even)', 'props': [('background-color', '#dbe9f7')]}]
+    fmt_cols = {'K':'{:.2f}','T':'{:.3f}','Market':'{:.2f}','Heston':'{:.2f}','SFV':'{:.2f}','BS':'{:.2f}','CRR':'{:.2f}','MC_BS':'{:.2f}','IV':'{:.3f}','SQError_Heston':'{:.4f}','SQError_SFV':'{:.4f}','SQError_BS':'{:.4f}','SQError_CRR':'{:.4f}','SQError_MC_BS':'{:.4f}'}
+    err_cols = ['SQError_Heston','SQError_SFV','SQError_BS','SQError_CRR','SQError_MC_BS']
+    styled = (df.style.format(fmt_cols).set_caption(caption_text).set_table_styles(blue_header + blue_rows).background_gradient(axis=None, subset=err_cols, cmap='Blues'))
+    return styled
+
+def plot_prices_3d(df_plot, ticker_str, subset_label, opt_type=None):
+    if opt_type is None:
+        try:
+            opt_type = opt_type_w.value
+        except NameError:
+            opt_type = 'Call'
+    fig = go.Figure()
+    fig.add_trace(go.Scatter3d(x=df_plot['K'], y=df_plot['T'], z=df_plot['Market'], mode='markers', name='Mercato', marker=dict(size=3, opacity=0.9)))
+    for name, size in [('Heston',3), ('SFV',3), ('BS',2), ('CRR',2), ('MC_BS',2)]:
+        if name in df_plot.columns and df_plot[name].notna().any():
+            fig.add_trace(go.Scatter3d(x=df_plot['K'], y=df_plot['T'], z=df_plot[name], mode='markers', name=name, marker=dict(size=size, opacity=0.7)))
+    fig.update_layout(title=f'Prezzi Call {ticker_str}: Mercato vs Modelli ({subset_label})', scene=dict(xaxis_title='Strike', yaxis_title='T (anni)', zaxis_title='Prezzo'), height=700, margin=dict(l=10,r=10,b=10,t=50), legend=dict(orientation='h', yanchor='bottom', y=0.02, xanchor='right', x=1))
+    fig.show()
+
+def _forward_price(S0, r, q, T):
+    return S0 * np.exp((r - q) * T)
+
+def _clean_iv_chain(ticker_api, expiries, S0, r, q, today):
+    rows = []
+    for exp in expiries:
+        try:
+            expiry = pd.to_datetime(exp)
+            T = calculate_time_to_maturity(expiry, today)
+            oc = ticker_api.option_chain(exp)
+            parts = []
+            for side in ('calls','puts'):
+                df = getattr(oc, side).copy()
+                if df is None or len(df)==0: 
+                    continue
+                keep = ['strike','bid','ask','lastPrice','impliedVolatility','volume','openInterest']
+                for c in keep:
+                    if c not in df.columns: df[c] = np.nan
+                df = df[keep].dropna(subset=['strike','bid','ask'])
+                df['mid'] = 0.5*(df['bid']+df['ask'])
+                df['T'] = T
+                df['side']= side
+                parts.append(df)
+            if not parts:
+                continue
+            df = pd.concat(parts, ignore_index=True)
+
+            iv = []
+            F = _forward_price(S0, r, q, T)
+            for _, rr in df.iterrows():
+                K = float(rr['strike'])
+                price = float(rr['mid'])
+                intrinsic = max(S0*np.exp(-q*T) - K*np.exp(-r*T), 0.0)
+                if not (intrinsic <= price <= S0*np.exp(-q*T)): 
+                    iv.append(np.nan); continue
+                iv.append(bs_implied_vol_from_price(price, S0, K, T, r, q))
+            df['iv_mid'] = iv
+
+            df = df[(df['iv_mid']>1e-4) & (df['iv_mid']<5.0)]
+            df = df[(df['volume'].fillna(0)>0) | (df['openInterest'].fillna(0)>0)]
+            df['F'] = F
+            df['k'] = np.log(df['strike']/F)
+            df['w'] = (df['iv_mid']**2) * T
+            rows.append(df[['strike','T','k','w','iv_mid','mid','volume','openInterest']])
+        except Exception:
+            continue
+    if not rows:
+        return pd.DataFrame(columns=['strike','T','k','w','iv_mid','mid','volume','openInterest'])
+    out = pd.concat(rows, ignore_index=True)
+    def _mad_filter(x, z=4.0):
+        med = np.median(x); mad = np.median(np.abs(x - med)) + 1e-12
+        return np.abs(x - med) <= z*1.4826*mad
+    return out.groupby('T', as_index=False, group_keys=False).apply(lambda g: g[_mad_filter(g['w'].values)])
+
+def _svi_w(k, params):
+    a,b,rho,m,sig = params
+    return a + b*(rho*(k-m) + np.sqrt((k-m)**2 + sig**2))
+
+def _fit_svi_slice(k, w, w_weights=None):
+    if w_weights is None: w_weights = np.ones_like(w)
+    a0 = max(1e-6, np.percentile(w, 10))
+    b0 = 0.5
+    rho0 = np.clip(np.corrcoef(k, w - w.mean())[0,1], -0.5, 0.5) if len(k)>2 else -0.1
+    m0 = 0.0
+    sig0 = 0.3
+    x0 = np.array([a0,b0,rho0,m0,sig0])
+
+    bounds = [(1e-10, 5.0), (1e-6,  50.0), (-0.999,0.999), (-2.0,  2.0), (1e-6,  5.0)]
+
+    def obj(x):
+        a,b,rho,m,sig = x
+        w_hat = _svi_w(k, x)
+        pen = 0.0
+        if np.any(w_hat <= 0):    pen += 1e6
+        return np.mean(w_weights*(w_hat - w)**2) + 1e-4*pen
+
+    res = minimize(obj, x0, method='trust-constr', bounds=bounds, options={'maxiter': 1000, 'gtol': 1e-8, 'xtol':1e-8})
+    return (res.x, res.fun, res.success)
+
+def _smooth_params_over_T(Ts, params_list):
+    P = np.array(params_list)
+    Ts = np.array(Ts)
+    Ts_sorted_idx = np.argsort(Ts)
+    Ts_sorted = Ts[Ts_sorted_idx]
+    P_sorted  = P[Ts_sorted_idx]
+    interps = [PchipInterpolator(Ts_sorted, P_sorted[:,j], extrapolate=True) for j in range(P_sorted.shape[1])]
+    return lambda t: np.array([f(t) for f in interps])
+
+def plot_iv_surface(ticker_api, expirations, today, S0, ticker_str, r=RISK_FREE_RATE):        #implementazione nuova superficie di volatilità
+    q = ticker_api.info.get('dividendYield', 0.0) or 0.0
+    df = _clean_iv_chain(ticker_api, expirations, S0, r, q, today)
+    if df.empty:
+        return
+
+    params_by_T = []
+    unique_T = np.sort(df['T'].unique())
+    for T in unique_T:
+        g = df[df['T']==T].copy()
+        w_w = (1.0 + g['volume'].fillna(0) + 0.1*g['openInterest'].fillna(0)).values
+        w_w = w_w / (w_w.mean() + 1e-12)
+        (pars, _, ok) = _fit_svi_slice(g['k'].values, g['w'].values, w_w)
+        params_by_T.append(pars)
+
+    param_fn = _smooth_params_over_T(unique_T, params_by_T)
+
+    k_grid = np.linspace(df['k'].quantile(0.02), df['k'].quantile(0.98), 61)
+    T_grid = np.linspace(max(1e-4, unique_T.min()), unique_T.max(), 21)
+    KK, TT = np.meshgrid(k_grid, T_grid)
+
+    W = np.zeros_like(KK)
+    for i, T in enumerate(T_grid):
+        pars_T = param_fn(T)
+        W[i,:] = _svi_w(k_grid, pars_T)
+        W[i,:] = np.clip(W[i,:], 1e-8, None)  # safety
+
+    IV = np.sqrt(W / TT)
+
+    K_grid = _forward_price(S0, r, q, T_grid.reshape(-1,1)) * np.exp(KK)
+
+    fig_iv = go.Figure(data=[go.Surface(x=K_grid, y=TT, z=IV, colorscale='Viridis')])
+    fig_iv.add_scatter3d(x=df['strike'], y=df['T'], z=df['iv_mid'], mode='markers', marker=dict(size=2, opacity=0.6), name='Punti (IV dal mid)')
+    fig_iv.update_layout(
+        title=f"Superficie IV (SVI smussata) – {ticker_str}",
+        scene=dict(xaxis_title='Strike', yaxis_title='T (anni)', zaxis_title='Implied Volatility'),
+        margin=dict(l=0, r=0, b=0, t=50), height=700,
+        legend=dict(orientation='h', yanchor='bottom', y=0.02, xanchor='right', x=1))
+    fig_iv.show()
+
+def _install_ui_theme():
+    css = """
+    <style>
+      :root{
+        --accent:#2b6cb0;        /* blue-600 */
+        --accent-2:#38a169;      /* green-500 */
+        --bg:#f6f8fb;
+        --card:#ffffff;
+        --text:#1f2937;          /* slate-800 */
+        --muted:#6b7280;         /* gray-500 */
+        --radius:14px;
+        --shadow:0 8px 24px rgba(0,0,0,.08);
+        --shadow-sm:0 4px 14px rgba(0,0,0,.06);
+        --border:#eef2f7;
+      }
+      .app-wrap{background:var(--bg); padding:12px; border-radius:var(--radius);}
+      .card{background:var(--card); border:1px solid var(--border);
+            border-radius:var(--radius); box-shadow:var(--shadow); padding:12px;}
+      .card + .card{margin-top:12px;}
+      .card-title{font-weight:700; color:var(--text); font-size:16px; margin:0 0 8px;}
+      .muted{color:var(--muted); font-size:12px; margin-top:2px;}
+      /* Buttons */
+      .widget-button>button{
+        border-radius:12px !important; border:none !important;
+        box-shadow:var(--shadow-sm); padding:6px 12px;
+      }
+      /* ToggleButtons */
+      .widget-toggle-buttons .widget-toggle-button{
+        border-radius:10px !important; overflow:hidden;
+      }
+      /* Badges */
+      .badges{display:flex; flex-wrap:wrap; gap:6px; margin-top:4px;}
+      .badge{display:inline-block; padding:4px 10px; border-radius:999px;
+             background:#eef2ff; color:#3730a3; font-weight:600; font-size:12px;}
+      .badge.green{background:#ecfdf5; color:#065f46;}
+      .badge.blue{background:#eff6ff; color:#1e40af;}
+      /* Tables (pandas Styler) */
+      table.dataframe{border-collapse:collapse; border-radius:12px; overflow:hidden;}
+      table.dataframe th, table.dataframe td{padding:8px 10px;}
+      thead th{background:#1f497d; color:#fff;}
+      tbody tr:nth-child(odd){background:#f1f6fd;}
+      tbody tr:nth-child(even){background:#e6eef9;}
+    </style>
+    """
+    display(HTML(css))
+
+def _set_plotly_theme():
+    base = go.layout.Template(layout=go.Layout(font=dict(family="ui-sans-serif, -apple-system, Segoe UI, Roboto, Helvetica, Arial",size=13, color="#1f2937"),
+            paper_bgcolor="white", plot_bgcolor="white", colorway=["#2b6cb0","#38a169","#dd6b20","#805ad5","#e53e3e","#319795"], hoverlabel=dict(bgcolor="white"),
+            margin=dict(l=20, r=20, t=50, b=20)))
+    pio.templates["sfv_custom_light"] = base
+    pio.templates.default = "plotly_white+sfv_custom_light"  # combina template built-in e custom
+
+_install_ui_theme()
+_set_plotly_theme()
+
+_w = lambda w: widgets.Layout(width=w)
+
+ticker_w = widgets.Text(value='AAPL', description='Ticker:', layout=_w('220px'))
+expiry_w = widgets.Dropdown(description='Expiry:', options=[], layout=_w('240px'))
+opt_type_w = widgets.ToggleButtons(options=['Call','Put'], value='Call', description='Tipo:', tooltips=['Prezzi CALL','Prezzi PUT'], layout=_w('240px'))
+sims_w = widgets.IntSlider(value=10000, min=2000, max=50000, step=1000, description='Simulations', readout_format='d', layout=_w('320px'))
+sfvN_w = widgets.IntSlider(value=1, min=1, max=60, step=1, description='SFV steps (QE)', readout_format='d', layout=_w('320px'))
+dev_w = widgets.ToggleButton(value=False, description='Developer', tooltip='Mostra log ottimizzazione')
+run_btn = widgets.Button(description='Esegui Analisi', button_style='primary', icon='play')
+oos_btn = widgets.Button(description='Analisi OOS (LOEO)', icon='flask', button_style='info')
+oos_enable_w = widgets.Checkbox(value=False, description="OOS (LOEO)", indent=False)
+title_html = widgets.HTML("<h3 style='margin:0; color:#1f2937;'>Benvenuto su [tool]</h3>")
+subtitle_html = widgets.HTML("<div class='muted'>Analisi comparativa modelli · Heston & SFV</div>")
+badges_html = widgets.HTML("<div class='badges'></div>")
+
+log_out = widgets.Output(layout={'border':'1px solid #bbb'})
+tables_out = widgets.Output()
+plots_out = widgets.Output()
+oos_out = widgets.Output()
+
+def _render_oos_placeholder():
+    oos_out.clear_output(wait=True)
+    display(HTML("<div class='muted'>"
+        "Analisi Out-of-sample non eseguita. "
+        "Per eseguire un’analisi OOS seleziona la spunta <b>OOS (LOEO)</b> nelle Impostazioni "
+        "e premi <b>Esegui Analisi</b>, oppure usa il pulsante <b>Analisi OOS (LOEO)</b>."
+        "</div>"))
+
+controls_card = widgets.VBox([widgets.HTML("<div class='card-title'>Impostazioni</div>"),
+    widgets.HBox([ticker_w, expiry_w], layout=widgets.Layout(justify_content='space-between')),
+    widgets.HBox([opt_type_w], layout=widgets.Layout(justify_content='flex-start')),
+    widgets.HBox([sims_w], layout=widgets.Layout(justify_content='flex-start')),
+    widgets.HBox([sfvN_w], layout=widgets.Layout(justify_content='flex-start')),
+    widgets.HBox([run_btn, oos_btn, dev_w], layout=widgets.Layout(gap='8px'))], layout=widgets.Layout())
+
+tabs = widgets.Tab(children=[
+    widgets.VBox([widgets.HTML("<div class='card-title'>Risultati</div>"), tables_out], layout=widgets.Layout()),
+    widgets.VBox([widgets.HTML("<div class='card-title'>Grafici</div>"), plots_out], layout=widgets.Layout()),
+    widgets.VBox([widgets.HTML("<div class='card-title'>OOS</div>"), oos_out], layout=widgets.Layout()),
+    widgets.VBox([widgets.HTML("<div class='card-title'>Log</div>"), log_out], layout=widgets.Layout())])
+
+for i, name in enumerate(['Risultati','Grafici','OOS','Log']):
+    tabs.set_title(i, name)
+
+header = widgets.VBox([title_html, subtitle_html, badges_html], layout=widgets.Layout(padding='8px 12px'))
+controls_shell = widgets.VBox([controls_card])
+controls_shell.add_class('card')
+tabs_shell = widgets.VBox([tabs])
+tabs_shell.add_class('card')
+page = widgets.VBox([header, controls_shell, tabs_shell])
+page.add_class('app-wrap')
+display(page)
+
+def _render_badges(ticker_str, expiry_str, opt_type, S0, T, q):
+    badges_html.value = f"""
+      <div class='badges'>
+        <span class='badge blue'>Ticker: {ticker_str}</span>
+        <span class='badge'>Expiry: {expiry_str}</span>
+        <span class='badge'>Tipo: {opt_type}</span>
+        <span class='badge green'>S₀: {S0:.2f}</span>
+        <span class='badge'>T: {T:.3f}y</span>
+        <span class='badge'>q: {q:.3f}</span>
+      </div>
+    """
+
+def refresh_expiries():
+    tkr = ticker_w.value.strip().upper()
+    with log_out:
+        log_out.clear_output(wait=True)
+        print(f"Aggiorno scadenze per {tkr}…")
+    try:
+        exps = yf.Ticker(tkr).options
+    except Exception as e:
+        exps = []
+        with log_out:
+            print("Errore durante il fetch delle scadenze:", repr(e))
+    expiry_w.options = exps if exps else []
+    if exps:
+        expiry_w.value = exps[0]
+        with log_out:
+            df_idx = pd.DataFrame({'Idx': range(len(exps)), 'Expiry': exps})
+            display(df_idx.style.set_caption("Scadenze disponibili (Idx ↔ Expiry)"))
+            print(f"Expiry selezionata: {expiry_w.value}")
+    else:
+        with log_out:
+            print("Nessuna expiry disponibile per il ticker.")
+refresh_expiries()
+
+def update_results(_=None):
+    tables_out.clear_output(wait=True)
+    plots_out.clear_output(wait=True)
+    with log_out:
+        print(f"\n>>> Avvio analisi | ticker={ticker_w.value} | expiry={expiry_w.value} | sims={sims_w.value} | SFV steps={sfvN_w.value} | developer={dev_w.value}")
+
+    ticker_str = ticker_w.value.strip().upper()
+    expiry_str = expiry_w.value
+    if not ticker_str or not expiry_str:
+        with log_out:
+            print("Seleziona un ticker valido e una scadenza.")
+        return
+
+    try:
+        ticker_api = yf.Ticker(ticker_str)
+        expiry = pd.to_datetime(expiry_str)
+        today = pd.Timestamp.today()
+        S0 = get_spot_price(ticker_str)
+        q = ticker_api.info.get('dividendYield', 0.0) or 0.0
+        T = calculate_time_to_maturity(expiry, today)
+
+        _render_badges(ticker_str, expiry_str, opt_type_w.value, S0, T, q)
+
+        dev = bool(dev_w.value)
+        buf_sfv = io.StringIO()
+        buf_hes = io.StringIO()
+        dev_logger = DevLogger(out_widget=log_out, enabled=dev)
+
+        with log_out:
+            print("\n[Calibrazione] SFV-Kou…")
+        try:
+            params_sfv = calibrate_sfv_jump(
+                ticker_str, expiry, RISK_FREE_RATE, q,
+                method='differential_evolution',
+                dev=dev, dev_stream=buf_sfv, N_step=int(sfvN_w.value),
+                dev_logger=dev_logger)
+            if not (isinstance(params_sfv, (list, tuple, np.ndarray)) and len(params_sfv) == 13 and np.all(np.isfinite(params_sfv))):
+                with log_out: print("[SFV] Calibrazione non valida (None/shape/NaN). Interrompo.")
+                return
+        except Exception as e:
+            with log_out: print(f"[SFV] Errore durante la calibrazione: {type(e).__name__}: {e}")
+            return
+
+        diag = build_option_diagnostics(ticker_api, expiry_str, S0, T, RISK_FREE_RATE, q, opt_type=opt_type_w.value)
+        with log_out:
+            print(f"\n[DIAG] {opt_type_w.value}s totali: {len(diag)} | tenute: {int(diag['selected'].sum())} | escluse: {len(diag) - int(diag['selected'].sum())}")
+
+        diag_sorted = diag.copy()
+        diag_sorted['dist'] = (diag_sorted['strike'] - S0).abs()
+        use_df = diag_sorted[diag_sorted['selected']].sort_values('dist') if diag_sorted['selected'].any() else diag_sorted.sort_values('dist')
+        use_df = use_df.head(8)
+        strikes_cal = use_df['strike'].to_numpy(dtype=float)
+        mkt_cal = use_df['mid'].to_numpy(dtype=float)
+
+        with log_out:
+            print("[Calibrazione] Heston+jumps…")
+        try:
+            params_heston = calibrate_heston_jump_by_data(
+                S0, strikes_cal, mkt_cal, T, RISK_FREE_RATE, q,
+                dev=dev, dev_logger=dev_logger)
+            if not (isinstance(params_heston, (list, tuple, np.ndarray)) and len(params_heston) == 8 and np.all(np.isfinite(params_heston))):
+                with log_out: print("[Heston] Calibrazione non valida (None/shape/NaN). Interrompo.")
+                return
+        except Exception as e:
+            with log_out: print(f"[Heston] Errore durante la calibrazione: {type(e).__name__}: {e}")
+            return
+
+        params_sfv = np.array(params_sfv, dtype=float)
+        params_heston = np.array(params_heston, dtype=float)
+
+        with log_out:
+            print("\nParametri stimati:")
+            kappa_sfv, theta_sfv, v0_sfv, xi_sfv, gamma_sfv, \
+                lambda_S_sfv, p_up_S_sfv, eta1_S_sfv, eta2_S_sfv, \
+                lambda_V_sfv, mu_J_V_sfv, sigma_J_V_sfv, rho_sfv = params_sfv
+            kappa, theta, v0, xi, rho, lambda_h, muJ_h, sigmaJ_h = params_heston
+            print(f"  SFV: kappa={kappa_sfv:.3f}, theta={theta_sfv:.3f}, v0={v0_sfv:.3f}, xi={xi_sfv:.3f}, "
+      f"gamma={gamma_sfv:.3f}, lambda_S={lambda_S_sfv:.3f}, p_up={p_up_S_sfv:.3f}, "
+      f"eta1={eta1_S_sfv:.3f}, eta2={eta2_S_sfv:.3f}, lambda_V={lambda_V_sfv:.3f}, "
+      f"muJ_V={mu_J_V_sfv:.3f}, sigmaJ_V={sigma_J_V_sfv:.3f}, rho={rho_sfv:.3f}")
+
+
+            print(f"  Heston+Jumps: kappa={kappa:.3f}, theta={theta:.3f}, v0={v0:.3f}, xi={xi:.3f}, "
+                  f"rho={rho:.3f}, lambda={lambda_h:.3f}, muJ={muJ_h:.3f}, sigmaJ={sigmaJ_h:.3f}")
+
+        price_funcs = make_price_wrappers(S0, T, q, tuple(params_heston), tuple(params_sfv), sims_heston=int(sims_w.value), sims_mc_bs=int(sims_w.value//2), N_sfv=int(sfvN_w.value), opt_type=opt_type_w.value)
+
+        df_all = build_results_table(diag, S0, T, q, price_funcs, opt_type=opt_type_w.value)
+        df_sel = build_results_table(diag[diag['selected']], S0, T, q, price_funcs, opt_type=opt_type_w.value) if diag['selected'].any() else df_all.iloc[0:0]
+
+        rmse_h_all = rmse_from(df_all, 'SQError_Heston')
+        rmse_s_all = rmse_from(df_all, 'SQError_SFV')
+        rmse_bs_all = rmse_from(df_all, 'SQError_BS')
+        rmse_crr_all = rmse_from(df_all, 'SQError_CRR')
+        rmse_mc_all = rmse_from(df_all, 'SQError_MC_BS')
+        rmse_h_sel = rmse_from(df_sel, 'SQError_Heston') if len(df_sel)>0 else np.nan
+        rmse_s_sel = rmse_from(df_sel, 'SQError_SFV') if len(df_sel)>0 else np.nan
+        rmse_bs_sel = rmse_from(df_sel, 'SQError_BS') if len(df_sel)>0 else np.nan
+        rmse_crr_sel = rmse_from(df_sel, 'SQError_CRR') if len(df_sel)>0 else np.nan
+        rmse_mc_sel = rmse_from(df_sel, 'SQError_MC_BS') if len(df_sel)>0 else np.nan
+
+        with tables_out:
+            styled_all = style_with_blue(df_all, f"ALL strikes – RMSE | Heston: {rmse_h_all:.4f} · SFV: {rmse_s_all:.4f} · BS: {rmse_bs_all:.4f} · CRR: {rmse_crr_all:.4f} · MC_BS: {rmse_mc_all:.4f}")
+            display(styled_all)
+            if len(df_sel)>0:
+                styled_sel = style_with_blue(df_sel, f"SELECTED strikes – RMSE | Heston: {rmse_h_sel:.4f} · SFV: {rmse_s_sel:.4f} · BS: {rmse_bs_sel:.4f} · CRR: {rmse_crr_sel:.4f} · MC_BS: {rmse_mc_sel:.4f}")
+                display(styled_sel)
+
+        with plots_out:
+            df_plot = df_sel if len(df_sel)>0 else df_all
+            subset_label = "SELECTED" if len(df_sel)>0 else "ALL"
+            plot_prices_3d(df_plot, ticker_str, subset_label, opt_type=opt_type_w.value)
+            plot_iv_surface(ticker_api, ticker_api.options, today, S0, ticker_str)
+        if oos_enable_w.value:
+            run_oos()  # popola la tab OOS
+        else:
+            _render_oos_placeholder()
+
+        if dev:
+            with log_out:
+                print("\n[Developer] Log differential_evolution (SFV):")
+                print(buf_sfv.getvalue() or "(nessun output)")
+                print("\n[Developer] Log L-BFGS-B (Heston):")
+                print(buf_hes.getvalue() or "(nessun output)")
+
+    except Exception as e:
+        with log_out:
+            print("\n[ERRORE] L'esecuzione si è interrotta:", repr(e))
+
+def run_oos(_=None):
+    oos_out.clear_output(wait=True)
+    with log_out:
+        print("\n>>> OOS LOEO (SFV) in esecuzione…")
+
+    tkr = ticker_w.value.strip().upper()
+    try:
+        exps_all = yf.Ticker(tkr).options
+        if not exps_all:
+            with log_out: print("[OOS] Nessuna expiry disponibile.")
+            return
+        exps = exps_all[:8]  # usa le prime 8 (puoi aumentare)
+
+        dev = bool(dev_w.value)
+        dev_logger = DevLogger(out_widget=log_out, enabled=dev)
+
+        df_oos = sfv_oos_leave_one_expiry_out(ticker=tkr, expiries=exps, r=RISK_FREE_RATE, q=yf.Ticker(tkr).info.get('dividendYield', 0.0) or 0.0, min_selected=6, n_train_cap=3, dev=dev, dev_logger=dev_logger)
+        with oos_out:
+            display(df_oos.style.format({'T_test':'{:.3f}','RMSE_train_avg':'{:.4f}','RMSE_test':'{:.4f}'}).set_caption('SFV LOEO OOS'))
+    except Exception as e:
+        with log_out:
+            print("[OOS] Errore:", repr(e))
+def _render_oos_placeholder():
+    with oos_out:
+        oos_out.clear_output(wait=True)
+        display(HTML(
+            "<div class='muted'>"
+            "Analisi Out-of-sample non eseguita. "
+            "Per eseguire un’analisi OOS seleziona la spunta <b>OOS (LOEO)</b> nelle Impostazioni "
+            "e premi <b>Esegui Analisi</b>, oppure usa il pulsante <b>Analisi OOS (LOEO)</b>."
+            "</div>"))
+
+
+
+oos_btn.on_click(run_oos)
+run_btn.on_click(update_results)
+ticker_w.on_submit(lambda _: refresh_expiries())
