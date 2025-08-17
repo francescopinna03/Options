@@ -9,15 +9,11 @@ from scipy.interpolate import PchipInterpolator
 from scipy.stats import norm
 import io
 import contextlib
-import plotly.graph_objects as go
 import plotly.io as pio
 from scipy.interpolate import griddata
-import ipywidgets as widgets
-from IPython.display import display, clear_output
 from IPython.display import display, clear_output, HTML
 import ipywidgets as widgets
 import plotly.graph_objects as go
-import plotly.io as pio
 
 pio.renderers.default = 'iframe'
 warnings.filterwarnings('ignore')
