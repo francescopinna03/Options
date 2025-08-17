@@ -599,12 +599,7 @@ def calibrate_heston_jump(ticker, maturity, r, q=0.0, dev=False, dev_stream=None
         return False
 
     de_opts = dict(maxiter=(40 if dev else 60), popsize=(12 if dev else 18))
-    de_res = differential_evolution(
-        recorder_coarse, bounds,
-        args=(S, strikes, market_prices, Ttm, r, q),
-        polish=False,              # niente L-BFGS-B implicito
-        disp=False, callback=_cb_de, **de_opts
-    )
+    de_res = differential_evolution(recorder_coarse, bounds, args=(S, strikes, market_prices, Ttm, r, q), polish=False, disp=False, callback=_cb_de, **de_opts)
     x_start = np.array(de_res.x, dtype=float)
 
     it_lbfgs = {"k": 0}       #stadio 2 della calibrazione: L-BFGS-B con miglioramento della line-search
