@@ -1103,12 +1103,7 @@ except NameError:
 
 _CRN_SEEDSEQ = None  
 
-def obj_sfv_jump_qe(p, S, r, q, T, strikes, market_mid,
-                    iv_mkt=None, w_pre=None, liq_weights=None,
-                    vols_bounds=(1e-4, 5.0), N_step=50, M=8000,
-                    alpha=1.0, rng=None, reg_weights=None,
-                    penalty_scale=0.0,
-                    sinkhorn_scale=0.0, sinkhorn_bins=30, sinkhorn_eps=1e-3):
+def obj_sfv_jump_qe(p, S, r, q, T, strikes, market_mid, iv_mkt=None, w_pre=None, liq_weights=None, vols_bounds=(1e-4, 5.0), N_step=50, M=8000, alpha=1.0, rng=None, reg_weights=None, penalty_scale=0.0, sinkhorn_scale=0.0, sinkhorn_bins=30, sinkhorn_eps=1e-3):
     ss = globals().get("_CRN_SEEDSEQ", None)
     if ss is not None:
         rng = np.random.default_rng(ss)
@@ -1132,7 +1127,6 @@ def obj_sfv_jump_qe(p, S, r, q, T, strikes, market_mid,
         return kappa, theta, v0, xi, rho, gamma, lambda_S, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V
 
     pars = None
-    # Try orientation A: [kappa, theta, v0, xi, rho, gamma, lambda_S, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V]
     try:
         cand = _unpackA(p)
         _kappa, _theta, _v0, _xi, _rho, _gamma, _lamS, _pup, _e1, _e2, _lamV, _muJV, _sigmaJV = cand
@@ -1325,7 +1319,7 @@ def _obj_sfv_multi(p, datasets, S0, r, q, alpha=1.0, seed=42, scale_by=1.0):
     losses = []
     for i, d in enumerate(datasets):
         rng_i = np.random.default_rng(seed + i)
-        loss = obj_sfv_jump_qe(p, S0, r, q, d['T'], d['strikes'], d['market_mid'], iv_mkt=d['iv_mkt'], w_pre=d['w_pre'], liq_weights=None, vols_bounds=(1e-6, 3.0), N_step=d['N_step'], M=d['M'], alpha=alpha, rng=rng_i, reg_weights={'w_gamma':0.01, 'w_lambdaS':0.01, 'w_lambdaV':0.01})
+        loss = obj_sfv_jump_qe(p, S0, r, q, d['T'], d['strikes'], d['market_mid'], iv_mkt=d['iv_mkt'], w_pre=d['w_pre'], liq_weights=None, vols_bounds=(1e-6, 3.0), N_step=d['N_step'], M=d['M'], alpha=alpha, rng=rng_i, reg_weights={'w_gamma':0.01, 'w_lambdaS':0.01, 'w_lambdaV':0.01}, penalty_scale=0.1, sinkhorn_scale=0.05, sinkhorn_bins=30, sinkhorn_eps=1e-3)
         losses.append(loss)
     return float(np.mean(losses)) / float(scale_by)
 
@@ -1378,144 +1372,330 @@ def obj_heston_jump_vec(p, S, strikes, market_prices, T, r, q=0.0, M=6000, steps
     model = heston_price_vectorized(S, strikes, T, r, kappa, theta, v0, rho, xi, lambda_jump, mu_J, sigma_J, q, simulations=M, steps=steps, seed=seed)
     return float(np.sum((model - market_prices) ** 2))
 
-def calibrate_heston_jump_by_data(S, strikes, market_prices, Ttm, r, q=0.0, dev=False, dev_logger=None):
-    bounds = [(0.1, 10), (1e-3, 1), (1e-3, 1), (1e-3, 2), (-0.95, 0.95), (0, 5), (-1, 1), (1e-3, 1)]
-    rec_coarse = ObjectiveRecorder(lambda x, *a: obj_heston_jump_vec(x, *a))
-    rec_fine   = ObjectiveRecorder(lambda x, *a: obj_heston_jump_vec(x, *a))
+# ---------------------------------------------------------------------
+#  CF DI BATES (HESTON + SALTI LOGNORMALI ALLA MERTON)
+# ---------------------------------------------------------------------
 
-    args_coarse = (S, strikes, market_prices, Ttm, r, q, 4000, 15, 11)
-    args_fine   = (S, strikes, market_prices, Ttm, r, q, 9000, 15, 23)
+def _bates_charfun(u, T, S0, r, q,
+                   kappa, theta, v0, xi, rho,
+                   lambda_jump, muJ, sigmaJ):
+    """
+    φ_Bates(u) = E[ e^{ i u log S_T } ] sotto Q con drift r-q-λk.
+    J ~ N(muJ, sigmaJ^2) sul log-salto; N ~ Poisson(λ).
+    Implementazione 'Little Heston Trap' (Lord–Kahl) per stabilità.
+    """
+    u = np.asarray(u, dtype=complex)
+    i = 1j
+    x = np.log(S0)
 
+    d  = np.sqrt((rho*xi*i*u - kappa)**2 + (xi*xi)*(i*u + u*u))
+    g  = (kappa - rho*xi*i*u - d) / (kappa - rho*xi*i*u + d)  # little trap
+    edT = np.exp(-d*T)
+
+    C = (kappa*theta/(xi*xi)) * ((kappa - rho*xi*i*u - d)*T - 2.0*np.log((1.0 - g*edT)/(1.0 - g)))
+    D = ((kappa - rho*xi*i*u - d)/(xi*xi)) * ((1.0 - edT)/(1.0 - g*edT))
+
+    k_jump  = np.exp(muJ + 0.5*sigmaJ*sigmaJ) - 1.0              # compensatore
+    phi_J   = np.exp(lambda_jump*T * (np.exp(i*u*muJ - 0.5*sigmaJ*sigmaJ*u*u) - 1.0))
+    drift   = (r - q - lambda_jump * k_jump)
+
+    return np.exp(C + D*v0 + i*u*(x + drift*T)) * phi_J
+
+
+def _Pj_bates_cf(j, K, T, S0, r, q,
+                 kappa, theta, v0, xi, rho,
+                 lambda_jump, muJ, sigmaJ,
+                 abs_tol=1e-8, rel_tol=1e-6, max_eval=200):
+    """Calcola P1 o P2 via integrale alla Lewis/Heston."""
+    logK = np.log(K)
+    i = 1j
+
+    if j == 2:
+        def integrand(u):
+            u = float(u)
+            if u == 0.0:
+                return 0.0
+            phi_u = _bates_charfun(u, T, S0, r, q,
+                                   kappa, theta, v0, xi, rho,
+                                   lambda_jump, muJ, sigmaJ)
+            val = np.exp(-i*u*logK) * (phi_u / (i*u))
+            return np.real(val)
+        I, _ = quad(integrand, 0.0, np.inf, epsabs=abs_tol, epsrel=rel_tol, limit=max_eval)
+        return 0.5 + I/np.pi
+
+    elif j == 1:
+        # φ(-i) chiuso-forma in Bates con drift compensato
+        phi_minus_i = S0 * np.exp((r - q) * T)
+
+        def integrand(u):
+            u = float(u)
+            if u == 0.0:
+                return 0.0
+            phi_shift = _bates_charfun(u - 1j, T, S0, r, q,
+                                       kappa, theta, v0, xi, rho,
+                                       lambda_jump, muJ, sigmaJ)
+            val = np.exp(-i*u*logK) * (phi_shift / (i*u*phi_minus_i))
+            return np.real(val)
+        I, _ = quad(integrand, 0.0, np.inf, epsabs=abs_tol, epsrel=rel_tol, limit=max_eval)
+        return 0.5 + I/np.pi
+
+    else:
+        raise ValueError("j deve essere 1 o 2.")
+
+
+def call_price_bates_cf(S0, K, T, r, q,
+                        kappa, theta, v0, xi, rho,
+                        lambda_jump, muJ, sigmaJ,
+                        abs_tol=1e-8, rel_tol=1e-6, max_eval=200):
+    """Prezzo di una call europea via CF del modello Bates."""
+    P1 = _Pj_bates_cf(1, K, T, S0, r, q,
+                      kappa, theta, v0, xi, rho,
+                      lambda_jump, muJ, sigmaJ,
+                      abs_tol, rel_tol, max_eval)
+    P2 = _Pj_bates_cf(2, K, T, S0, r, q,
+                      kappa, theta, v0, xi, rho,
+                      lambda_jump, muJ, sigmaJ,
+                      abs_tol, rel_tol, max_eval)
+    return float(S0*np.exp(-q*T)*P1 - K*np.exp(-r*T)*P2)
+
+
+def put_price_bates_cf(S0, K, T, r, q,
+                       kappa, theta, v0, xi, rho,
+                       lambda_jump, muJ, sigmaJ,
+                       abs_tol=1e-8, rel_tol=1e-6, max_eval=200):
+    """Prezzo di una put europea via put-call parity dal modello Bates."""
+    call_price = call_price_bates_cf(S0, K, T, r, q,
+                                     kappa, theta, v0, xi, rho,
+                                     lambda_jump, muJ, sigmaJ,
+                                     abs_tol, rel_tol, max_eval)
+    # Put-call parity: P = C - S*e^(-q*T) + K*e^(-r*T)
+    return float(call_price - S0*np.exp(-q*T) + K*np.exp(-r*T))
+
+
+def option_price_bates_cf(S0, K, T, r, q,
+                          kappa, theta, v0, xi, rho,
+                          lambda_jump, muJ, sigmaJ,
+                          option_type='call',
+                          abs_tol=1e-8, rel_tol=1e-6, max_eval=200):
+    """
+    Prezzo di un'opzione europea (call o put) via CF del modello Bates.
+    
+    Parameters:
+    -----------
+    option_type : str
+        'call' per call options, 'put' per put options
+    """
+    if option_type.lower() == 'call':
+        return call_price_bates_cf(S0, K, T, r, q,
+                                   kappa, theta, v0, xi, rho,
+                                   lambda_jump, muJ, sigmaJ,
+                                   abs_tol, rel_tol, max_eval)
+    elif option_type.lower() == 'put':
+        return put_price_bates_cf(S0, K, T, r, q,
+                                  kappa, theta, v0, xi, rho,
+                                  lambda_jump, muJ, sigmaJ,
+                                  abs_tol, rel_tol, max_eval)
+    else:
+        raise ValueError("option_type deve essere 'call' o 'put'")
+
+
+def heston_bates_cf_prices(S0, strikes, T, r,
+                           kappa, theta, v0, xi, rho,
+                           lambda_jump, muJ, sigmaJ, q=0.0,
+                           option_type='call',
+                           abs_tol=1e-8, rel_tol=1e-6, max_eval=200):
+    """
+    Vettoriale su più strike per call o put.
+    
+    Parameters:
+    -----------
+    option_type : str or array-like
+        'call' per call options, 'put' per put options, 
+        oppure array con tipo per ogni strike
+    """
+    strikes = np.asarray(strikes, float)
+    out = np.empty_like(strikes, dtype=float)
+    
+    # Se option_type è una stringa, applica a tutti gli strike
+    if isinstance(option_type, str):
+        option_types = [option_type] * len(strikes)
+    else:
+        option_types = np.asarray(option_type)
+        if len(option_types) != len(strikes):
+            raise ValueError("option_type array deve avere la stessa lunghezza di strikes")
+    
+    for j, (K, opt_type) in enumerate(zip(strikes, option_types)):
+        out[j] = option_price_bates_cf(S0, float(K), T, r, q,
+                                       kappa, theta, v0, xi, rho,
+                                       lambda_jump, muJ, sigmaJ,
+                                       option_type=opt_type,
+                                       abs_tol=abs_tol, rel_tol=rel_tol, max_eval=max_eval)
+    return out
+
+# ---------------------------------------------------------------------
+#  FUNZIONE OBIETTIVO (MSE pesato + penalità opzionale)
+# ---------------------------------------------------------------------
+
+def obj_heston_jump_cf(p, S, strikes, market_prices, T, r, q=0.0, option_types=None, w=None, penalty=None, abs_tol=1e-8, rel_tol=1e-6, max_eval=200):
+    kappa, theta, v0, xi, rho, lambda_jump, muJ, sigmaJ = map(float, p)
+    
+    if option_types is None:
+        option_types = 'call'
+
+    model = heston_bates_cf_prices(S, strikes, T, r, kappa, theta, v0, xi, rho, lambda_jump, muJ, sigmaJ, q=q, option_type=option_types, abs_tol=abs_tol, rel_tol=rel_tol, max_eval=max_eval)
+
+    market = np.asarray(market_prices, float)
+    if w is None:
+        w = np.ones_like(market)
+    w = np.asarray(w, float)
+    w = w / (w.mean() + 1e-12)
+
+    mse = np.mean(w * (model - market)**2)
+
+    reg = 0.0
+    if isinstance(penalty, dict):
+        reg += float(penalty.get('w_rho', 0.0)) 
+        reg += float(penalty.get('w_sigmaJ', 0.0))
+        reg += float(penalty.get('w_lambda', 0.0))
+        reg += float(penalty.get('w_xi', 0.0))
+
+    return float(mse + reg)
+
+# ---------------------------------------------------------------------
+#  CALIBRAZIONE: DE (coarse)  →  L-BFGS-B (fine) con fallback Powell
+# ---------------------------------------------------------------------
+
+# Se nel tuo file esiste già ObjectiveRecorder e DevLogger, saranno usati.
+try:
+    ObjectiveRecorder
+except NameError:
+    class ObjectiveRecorder:
+        def __init__(self, func): self.func, self.last_x, self.last_f = func, None, None
+        def __call__(self, x, *a, **kw):
+            f = self.func(x, *a, **kw); self.last_x = np.array(x, float); self.last_f = f; return f
+
+def calibrate_heston_jump_cf_by_data(S, strikes, market_prices, Ttm, r, q=0.0, option_types=None, w=None, penalty=None, dev=False, dev_logger=None, abs_tol=1e-8, rel_tol=1e-6, max_eval=200, bounds=None):
+    if bounds is None:
+        bounds = [(0.1, 10.0), (1e-4, 1.0), (1e-4, 1.0), (1e-3, 2.0), (-0.95, 0.95), (0.0, 5.0), (-1.0, 1.0), (1e-3, 1.0)]
+
+    def _obj(x, *args):
+        return obj_heston_jump_cf(x, *args, abs_tol=abs_tol, rel_tol=rel_tol, max_eval=max_eval)
+
+    rec_coarse = ObjectiveRecorder(_obj)
+    rec_fine   = ObjectiveRecorder(_obj)
+
+    args = (S, np.asarray(strikes, float), np.asarray(market_prices, float),
+            float(Ttm), float(r), float(q), option_types, w, penalty)
     it_de = {"k": 0}
     def _cb_de(xk, conv):
         it_de["k"] += 1
-        if dev and dev_logger is not None and rec_coarse.last_f is not None:
-            dev_logger.write(f"[Heston] differential_evolution step {it_de['k']}: f(x)= {rec_coarse.last_f:.6g}")
+        if dev and (dev_logger is not None) and (rec_coarse.last_f is not None) and (it_de["k"] % 3 == 0):
+            dev_logger.write(f"[Bates-CF] DE step {it_de['k']}: f(x) = {rec_coarse.last_f:.6g}")
         return False
-
-    de_res = differential_evolution(rec_coarse, bounds, args=args_coarse, maxiter=(30 if dev else 50), popsize=(10 if dev else 16), polish=False, disp=False, callback=_cb_de)
-    x_start = np.array(de_res.x, dtype=float)
+    de_opts = dict(maxiter=(40 if not dev else 20), popsize=(16 if not dev else 10),
+                   mutation=(0.6, 1.0), recombination=0.9, polish=False, disp=False, seed=42)
+    res_de = differential_evolution(wrap_with_feller(rec_coarse, mode=globals().get('FELLER_MODE','penalty'), weight=globals().get('FELLER_WEIGHT',1e3)), bounds, args=args, callback=_cb_de, **de_opts)
+    x0 = np.array(res_de.x, float)
 
     it_lb = {"k": 0}
     def _cb_lb(xk):
         it_lb["k"] += 1
-        if dev and dev_logger is not None and rec_fine.last_f is not None:
-            dev_logger.write(f"[Heston] L-BFGS-B iter {it_lb['k']}: f(x)= {rec_fine.last_f:.6g}")
+        if dev and (dev_logger is not None) and (rec_fine.last_f is not None) and (it_lb["k"] % 5 == 0):
+            dev_logger.write(f"[Bates-CF] L-BFGS iter {it_lb['k']}: f(x) = {rec_fine.last_f:.6g}")
+    lb_opts = dict(maxiter=120, disp=False, maxls=60, ftol=1e-8, gtol=1e-5, eps=1e-8)
+    res_lb = minimize(wrap_with_feller(rec_fine, mode=globals().get('FELLER_MODE','penalty'), weight=globals().get('FELLER_WEIGHT',1e3)), x0=x0, args=args, bounds=bounds, method='L-BFGS-B', options=lb_opts, callback=_cb_lb)
+    if res_lb.success and np.all(np.isfinite(res_lb.x)):
+        return np.array(res_lb.x, float)
 
-    res_lb = minimize(rec_fine, x0=x_start, args=args_fine, bounds=bounds, method='L-BFGS-B', options={'maxiter': 100, 'disp': False, 'maxls': 50, 'ftol': 1e-8, 'gtol': 1e-5, 'eps': 1e-8}, callback=_cb_lb)
+    if dev and dev_logger is not None:
+        msg = getattr(res_lb, "message", "n/a")
+        dev_logger.write(f"[Bates-CF] L-BFGS-B non riuscito ({msg}). Provo Powell...")
 
-    if not (res_lb.success and np.all(np.isfinite(res_lb.x))):
-        if dev and dev_logger is not None:
-            dev_logger.write(f"[Heston] L-BFGS-B non riuscito ({getattr(res_lb,'message','n/a')}). Avvio Powell…")           #backstop (test 13/8)
-        it_pw = {"k": 0}
-        def _cb_pw(xk):
-            it_pw["k"] += 1
-            if dev and dev_logger is not None and rec_fine.last_f is not None:
-                dev_logger.write(f"[Heston] Powell iter {it_pw['k']}: f(x)= {rec_fine.last_f:.6g}")
-        res_pw = minimize(rec_fine, x0=x_start, args=args_fine, bounds=bounds, method='Powell', options={'maxiter': 180, 'disp': False}, callback=_cb_pw)
+    res_pw = minimize(rec_fine, x0=x0, args=args, bounds=bounds, method='Powell', options={'maxiter': 200, 'disp': False})
 
-        def _val(x): return float(rec_fine(np.array(x, float), *args_fine))
-        cand = []
-        try: cand.append(('DE', x_start, _val(x_start)))
+    def _val(x):
+        return float(rec_fine(np.array(x, float), *args))
+
+    candidates = []
+    try: candidates.append(('DE', x0, _val(x0)))
+    except: pass
+    if res_lb.success and np.all(np.isfinite(res_lb.x)):
+        try: candidates.append(('LBFGS', res_lb.x, _val(res_lb.x)))
         except: pass
-        if res_lb.success and np.all(np.isfinite(res_lb.x)):
-            try: cand.append(('LBFGS', res_lb.x, _val(res_lb.x)))
-            except: pass
-        if res_pw.success and np.all(np.isfinite(res_pw.x)):
-            try: cand.append(('POWELL', res_pw.x, _val(res_pw.x)))
-            except: pass
-        if not cand:
-            raise RuntimeError("Ottimizzazione Heston non riuscita: nessuna soluzione valida.")
-        best_name, best_x, best_f = min(cand, key=lambda t: t[2])
-        if dev and dev_logger is not None:
-            dev_logger.write(f"[Heston] Selezionata soluzione {best_name} con f(x)= {best_f:.6g}")
-        return best_x
+    if res_pw.success and np.all(np.isfinite(res_pw.x)):
+        try: candidates.append(('POWELL', res_pw.x, _val(res_pw.x)))
+        except: pass
 
-    return res_lb.x
+    if not candidates:
+        raise RuntimeError("Calibrazione Bates-CF: nessuna soluzione valida.")
 
-def calibrate_heston_jump(ticker, maturity, r, q=0.0, dev=False, dev_stream=None, dev_logger=None):
+    best = min(candidates, key=lambda t: t[2])[1]
+    if dev and dev_logger is not None:
+        dev_logger.write(f"[Bates-CF] Selezionata soluzione fallback con f(x)={_val(best):.6g}")
+    return np.array(best, float)
+
+def calibrate_heston_jump(ticker, maturity, r, q=0.0, option_type='both', dev=False, dev_stream=None, dev_logger=None):
     S = get_spot_price(ticker)
     maturity_str = maturity.strftime('%Y-%m-%d')
 
-    oc_calls = yf.Ticker(ticker).option_chain(maturity_str).calls
-    if oc_calls is None or len(oc_calls) == 0:
-        raise RuntimeError("Option chain vuota per la scadenza richiesta.")
-    oc = oc_calls[['strike','lastPrice']].dropna().copy()
-    oc = oc[oc['lastPrice'] > 0]
-    near = oc[oc['strike'].between(0.9*S, 1.1*S)].copy()
-    if near.empty:
-        oc['dist'] = (oc['strike'] - S).abs()
-        sel = oc.sort_values('dist').head(8)
-    else:
-        near['dist'] = (near['strike'] - S).abs()
-        sel = near.sort_values('dist').head(8)
+    ticker_obj = yf.Ticker(ticker)
+    option_chain = ticker_obj.option_chain(maturity_str)
+    
+    strikes_all = []
+    market_prices_all = []
+    option_types_all = []
+    
+    if option_type in ['call', 'both']:
+        oc_calls = option_chain.calls
+        if oc_calls is not None and len(oc_calls) > 0:
+            oc_calls = oc_calls[['strike','lastPrice']].dropna().copy()
+            oc_calls = oc_calls[oc_calls['lastPrice'] > 0]
+            
+            # Seleziona strike vicini al prezzo spot
+            near_calls = oc_calls[oc_calls['strike'].between(0.9*S, 1.1*S)].copy()
+            if near_calls.empty:
+                oc_calls['dist'] = (oc_calls['strike'] - S).abs()
+                sel_calls = oc_calls.sort_values('dist').head(4)
+            else:
+                near_calls['dist'] = (near_calls['strike'] - S).abs()
+                sel_calls = near_calls.sort_values('dist').head(4)
+            
+            strikes_all.extend(sel_calls['strike'].values.astype(float))
+            market_prices_all.extend(sel_calls['lastPrice'].values.astype(float))
+            option_types_all.extend(['call'] * len(sel_calls))
+    
+    if option_type in ['put', 'both']:
+        oc_puts = option_chain.puts
+        if oc_puts is not None and len(oc_puts) > 0:
+            oc_puts = oc_puts[['strike','lastPrice']].dropna().copy()
+            oc_puts = oc_puts[oc_puts['lastPrice'] > 0]
+            
+            near_puts = oc_puts[oc_puts['strike'].between(0.9*S, 1.1*S)].copy()
+            if near_puts.empty:
+                oc_puts['dist'] = (oc_puts['strike'] - S).abs()
+                sel_puts = oc_puts.sort_values('dist').head(4)
+            else:
+                near_puts['dist'] = (near_puts['strike'] - S).abs()
+                sel_puts = near_puts.sort_values('dist').head(4)
+            
+            strikes_all.extend(sel_puts['strike'].values.astype(float))
+            market_prices_all.extend(sel_puts['lastPrice'].values.astype(float))
+            option_types_all.extend(['put'] * len(sel_puts))
+    
+    if len(strikes_all) < 3:
+        raise RuntimeError(f"Troppi pochi strike utili ({len(strikes_all)}).")
 
-    strikes = sel['strike'].values.astype(float)
-    market_prices = sel['lastPrice'].values.astype(float)
-    if strikes.size < 3:
-        raise RuntimeError(f"Troppi pochi strike utili ({strikes.size}).")
-
+    strikes = np.array(strikes_all, dtype=float)
+    market_prices = np.array(market_prices_all, dtype=float)
+    option_types = np.array(option_types_all)
+    
     Ttm = calculate_time_to_maturity(maturity)
-    bounds = [(0.1, 10), (1e-3, 1), (1e-3, 1), (1e-3, 2), (-0.95, 0.95), (0, 5), (-1, 1), (1e-3, 1)] #rispettivamente kappa-theta-v0-xi-lambda-mu-sigma (che includono la componente jump)
-    recorder_coarse = ObjectiveRecorder(obj_heston_jump)
-    recorder_fine   = ObjectiveRecorder(obj_heston_jump)
-
-    it_de = {"k": 0}      #stadio 1 della calibrazione: Differential Evolution (aggiornamento 14/8)
-    def _cb_de(xk, conv):
-        it_de["k"] += 1
-        if dev and dev_logger is not None and recorder_coarse.last_f is not None:
-            dev_logger.write(f"[Heston] differential_evolution step {it_de['k']}: f(x)= {recorder_coarse.last_f:.6g}")
-        return False
-
-    de_opts = dict(maxiter=(40 if dev else 60), popsize=(12 if dev else 18))
-    de_res = differential_evolution(recorder_coarse, bounds, args=(S, strikes, market_prices, Ttm, r, q), polish=False, disp=False, callback=_cb_de, **de_opts)
-    x_start = np.array(de_res.x, dtype=float)
-
-    it_lbfgs = {"k": 0}       #stadio 2 della calibrazione: L-BFGS-B con miglioramento della line-search
-    def _cb_lbfgs(xk):
-        it_lbfgs["k"] += 1
-        if dev and dev_logger is not None and recorder_fine.last_f is not None:
-            dev_logger.write(f"[Heston] L-BFGS-B iter {it_lbfgs['k']}: f(x)= {recorder_fine.last_f:.6g}")
-
-    lbfgs_opts = {'maxiter': 120, 'disp': False, 'maxls': 60, 'ftol': 1e-8, 'gtol': 1e-5, 'eps': 1e-8}
-    res_lbfgs = minimize(recorder_fine, x0=x_start, args=(S, strikes, market_prices, Ttm, r, q), bounds=bounds, method='L-BFGS-B', options=lbfgs_opts, callback=_cb_lbfgs)
-
-    if not (res_lbfgs.success and np.all(np.isfinite(res_lbfgs.x))):
-        if dev and dev_logger is not None:
-            dev_logger.write(f"[Heston] L-BFGS-B non riuscito ({getattr(res_lbfgs, 'message','n/a')}). Avvio Powell…")
-
-        it_pow = {"k": 0}
-        def _cb_powell(xk):
-            it_pow["k"] += 1
-            if dev and dev_logger is not None and recorder_fine.last_f is not None:
-                dev_logger.write(f"[Heston] Powell iter {it_pow['k']}: f(x)= {recorder_fine.last_f:.6g}")
-
-        res_pow = minimize(recorder_fine, x0=x_start, args=(S, strikes, market_prices, Ttm, r, q), bounds=bounds, method='Powell', options={'maxiter': 200, 'disp': False}, callback=_cb_powell)
-        def _val(x):
-            return float(recorder_fine(np.array(x, dtype=float), S, strikes, market_prices, Ttm, r, q))
-
-        candidates = []
-        try: candidates.append(('DE', x_start, _val(x_start)))
-        except Exception: pass
-        if res_lbfgs.success and np.all(np.isfinite(res_lbfgs.x)):
-            try: candidates.append(('LBFGS', res_lbfgs.x, _val(res_lbfgs.x)))
-            except Exception: pass
-        if res_pow.success and np.all(np.isfinite(res_pow.x)):
-            try: candidates.append(('POWELL', res_pow.x, _val(res_pow.x)))
-            except Exception: pass
-
-        if not candidates:
-            raise RuntimeError("Ottimizzazione Heston non riuscita: nessuna soluzione valida.")
-
-        best_name, best_x, best_f = min(candidates, key=lambda t: t[2])
-        if dev and dev_logger is not None:
-            dev_logger.write(f"[Heston] Selezionata soluzione {best_name} con f(x)= {best_f:.6g}")
-        return best_x
-
-    return res_lbfgs.x
+    bounds = [(0.1, 10), (1e-3, 1), (1e-3, 1), (1e-3, 2), (-0.95, 0.95), (0, 5), (-1, 1), (1e-3, 1)]
+    
+    return calibrate_heston_jump_cf_by_data(S, strikes, market_prices, Ttm, r, q, option_types=option_types, dev=dev, dev_logger=dev_logger, bounds=bounds)
 
 def smart_initial_guess(S, strikes, market_prices, T, r, q):
-    atm_idx = int(np.argmin(np.abs(strikes - S)))            # IV ATM → v0/theta
+    atm_idx = int(np.argmin(np.abs(strikes - S)))
     try:
         atm_iv = bs_implied_vol_from_price(market_prices[atm_idx], S, strikes[atm_idx], T, r, q)
         v0_est = max((atm_iv or 0.2)**2, 0.01)
@@ -1663,22 +1843,21 @@ def calibrate_sfv_jump_optimized(ticker, maturity, r, q=0.0, method='differentia
     iv_mkt = np.array([bs_implied_vol_from_price(m, S, K, Ttm, r, q) for K, m in zip(strikes, market_prices)])
     vegas = np.array([bs_vega(S, K, Ttm, r, q, iv) if (np.isfinite(iv) and 1e-6 < iv < 3.0) else 0.0 for K, iv in zip(strikes, iv_mkt)])
     w_vega = 1.0 / (vegas + 1e-6)
-    w_liq  = liq_weights / (liq_weights.mean() + 1e-12)
-    w_pre  = w_vega * w_liq
+    w_liq = liq_weights / (liq_weights.mean() + 1e-12)
+    w_pre = w_vega * w_liq
 
     if N_step is None:
         N_step = max(8, int(np.ceil(Ttm * 252 / 3)))
 
     M_coarse = 3000 if Ttm <= 30/365 else 4000
-    M_fine   = 5000 if Ttm <= 30/365 else 7000
+    M_fine = 5000 if Ttm <= 30/365 else 7000
     if dev:
         M_coarse = max(2000, int(0.7 * M_coarse))
-        M_fine   = max(3000, int(0.8 * M_fine))
+        M_fine = max(3000, int(0.8 * M_fine))
 
     p0 = smart_initial_guess(S, strikes, market_prices, Ttm, r, q)
     z0 = sfv_p_to_z(p0)
 
-    # pesi ridge più stretti su gamma, lambdaS e lambdaV, più leggeri sui livelli di var.
     if ridge_w is None:
         ridge_w = np.array([0.10, 0.10, 0.10, 0.10,
             0.05, 0.06, 0.02, 0.02, 0.02, 0.06,
@@ -1688,14 +1867,13 @@ def calibrate_sfv_jump_optimized(ticker, maturity, r, q=0.0, method='differentia
         raise ValueError("ridge_w deve essere lungo 13.")
 
     if freeze_mask is None:
-        freeze_mask = np.zeros(13, dtype=bool)  # Nessun parametro congelato di default.
+        freeze_mask = np.zeros(13, dtype=bool)
     else:
         freeze_mask = np.asarray(freeze_mask, dtype=bool)
         if freeze_mask.shape != (13,):
             raise ValueError("freeze_mask deve essere lungo 13.")
     free_idx = np.where(~freeze_mask)[0]
     if free_idx.size == 0:
-        # niente da ottimizzare
         return sfv_z_to_p(z0)
 
     z_bounds_full = np.array([[np.log(1e-4), np.log(2.0)], [np.log(1/252), np.log(2.0)],
@@ -1920,7 +2098,7 @@ def calibrate_sfv_multi_expiry(datasets, S0, r, q, dev=False, dev_logger=None): 
     bounds = [(0.1, 10), (1e-3, 1), (1e-3, 1), (1e-3, 2), (-3.5, 3.5), (0.0, 5.0), (0.01, 0.99), (1.05, 10.0), (0.05, 10.0), (0.0, 5.0), (-1.0, 1.0), (1e-3, 1.0), (-0.95, 0.95)]
 
     rec_coarse = ObjectiveRecorder(lambda x: _obj_sfv_multi(x, datasets, S0, r, q, alpha=1.0, seed=777))
-    rec_fine   = ObjectiveRecorder(lambda x: _obj_sfv_multi(x, datasets, S0, r, q, alpha=1.0, seed=1234))
+    rec_fine = ObjectiveRecorder(lambda x: _obj_sfv_multi(x, datasets, S0, r, q, alpha=1.0, seed=1234))
 
     it_de = {'k': 0}
     def _cb_de(xk, conv):
