@@ -15,6 +15,11 @@ from IPython.display import display, clear_output, HTML
 import ipywidgets as widgets
 import plotly.graph_objects as go
 import time
+from scipy.fft import fft, ifft, fftfreq  # FFT pricing for Heston
+from scipy.interpolate import CubicSpline  # Smooth interpolation of FFT output
+from sklearn.gaussian_process import GaussianProcessRegressor  # Machine learning for IV surface
+from sklearn.gaussian_process.kernels import RBF, Matern, WhiteKernel, ExpSineSquared
+from sklearn.preprocessing import StandardScaler
 
 pio.renderers.default = 'iframe'
 warnings.filterwarnings('ignore')
@@ -93,6 +98,34 @@ MAX_SPREAD_PCT = 0.30
 IV_MIN, IV_MAX = 1e-6, 2.5
 PRICE_MAX_MULT = 2.0
 REQUIRE_LIQUID = False
+'''
+Inserire meccanismo di penalità
+'''
+def feller_violation(p, idx=HB_IDX):
+    kappa, theta, xi = float(p[idx['KAPPA']]), float(p[idx['THETA']]), float(p[idx['XI']])
+    return max(0.0, xi*xi - 2.0*kappa*theta)
+
+def project_feller(p, idx=HB_IDX, eps=1e-4, kmin=1e-8, thmin=1e-8):
+    p = _np.array(p, dtype=float, copy=True)
+    kappa, theta, xi = p[idx['KAPPA']], p[idx['THETA']], p[idx['XI']]
+    kappa = max(kappa, kmin)
+    theta = max(theta, thmin)
+    limit = max(2.0*kappa*theta, kmin*thmin)
+    if xi*xi > limit:
+        p[idx['XI']] = float((limit**0.5) * (1.0 - eps))
+    return p
+
+def wrap_with_feller(objective, idx=HB_IDX, mode='penalty', weight=1e3, eps=1e-4):
+    def wrapped(p, *args, **kwargs):
+        p2 = _np.array(p, dtype=float, copy=True)
+        if mode == 'hard':
+            p2 = project_feller(p2, idx=idx, eps=eps)
+        loss = objective(p2, *args, **kwargs)
+        if mode == 'penalty':
+            viol = feller_violation(p2, idx=idx)  # xi^2 - 2 kappa theta
+            loss = loss + weight * (viol**2)
+        return loss
+    return wrapped
 
 def calculate_time_to_maturity(maturity_date, today=None):
     if today is None:
@@ -108,7 +141,6 @@ def calculate_time_to_maturity(maturity_date, today=None):
 
 def get_spot_price(ticker):
     t = yf.Ticker(ticker)
-    # fast_info è velocissimo ma può tornare None in alcuni casi → fallback
     px = None
     try:
         fi = getattr(t, "fast_info", None)
@@ -165,31 +197,30 @@ def crr_binomial_price(S, K, T, r, q, sigma, N=2000, option_type='call'):
         payoff = disc * (p * payoff[1:i+1] + (1 - p) * payoff[0:i])
     return float(payoff[0])
 
-def monte_carlo_antithetic_control(S0, K, T, r, sigma, simulations=100000, steps=1,
-                                   option_type='call', q=0.0, seed=42):
+def monte_carlo_antithetic_control(S0, K, T, r, sigma, simulations=100000, steps=1, option_type='call', q=0.0, seed=42):
     rng = np.random.default_rng(seed)
     dt = T / steps
     half = simulations // 2
     payoffs = np.empty(half)
-    ctrls  = np.empty(half)
+    ctrls = np.empty(half)
     expected_ctrl = S0 * np.exp(-q * T)  # E[e^{-rT} S_T] = S0 e^{-qT}
 
     for i in range(half):
         Z = rng.standard_normal(steps)
-        ST     = S0 * np.exp(np.sum((r - q - 0.5*sigma**2)*dt + sigma*np.sqrt(dt)*Z))
+        ST = S0 * np.exp(np.sum((r - q - 0.5*sigma**2)*dt + sigma*np.sqrt(dt)*Z))
         ST_ant = S0 * np.exp(np.sum((r - q - 0.5*sigma**2)*dt - sigma*np.sqrt(dt)*Z))
         if option_type == 'call':
             p = 0.5*(max(ST-K,0.0)+max(ST_ant-K,0.0))
         else:
             p = 0.5*(max(K-ST,0.0)+max(K-ST_ant,0.0))
         payoffs[i] = np.exp(-r*T)*p
-        ctrls[i]   = 0.5*(ST+ST_ant)*np.exp(-r*T)
+        ctrls[i] = 0.5*(ST+ST_ant)*np.exp(-r*T)        #controllo variabili antetetiche testato con successo, nessuna modifica da segnalare
 
     X, Y = payoffs, ctrls
     varY = np.var(Y)
     if varY == 0:
         return float(X.mean())
-    c = - np.cov(X, Y, ddof=1)[0, 1] / varY
+    c = -np.cov(X, Y, ddof=1)[0, 1] / varY
     return float((X + c*(Y - expected_ctrl)).mean())
 
 
@@ -244,9 +275,153 @@ def _qe_variance_step(v, dt, kappa, theta, xi, Z2, rng):
         else:
             return max(rng.exponential(1.0 / (beta + 1e-12)), 1e-8)
 
+def sfv_sigma_rho_eff(xi: float, rho: float, gamma: float):
+    xi = float(xi); rho = float(rho); gamma = float(gamma)
+    sigma2 = xi*xi + gamma*gamma + 2.0*rho*xi*gamma
+    sigma2 = max(sigma2, 1e-16)
+    sigma_eff = float(np.sqrt(sigma2))
+    rho_eff = (rho*xi + gamma) / sigma_eff
+    rho_eff = float(np.clip(rho_eff, -0.999, 0.999))
+    return sigma_eff, rho_eff
+
 def kou_compensator(p_up, eta1, eta2):
     EJ = p_up * (eta1/(eta1 - 1.0)) + (1.0 - p_up) * (eta2/(eta2 + 1.0))
     return EJ - 1.0
+
+# =====================================================================
+# ESSCHER TILT AND SINKHORN UTILITIES PER IL MODELLO SFV (COMPONENTI SVLUPPATE DAL 21/8)
+# =====================================================================
+def esscher_kou_theta(lambda_S, p_up, eta1, eta2, drift_target, tol=1e-8, max_iter=100):
+    if not (np.isfinite(lambda_S) and np.isfinite(p_up) and np.isfinite(eta1) and np.isfinite(eta2)):        #meccanismo di controllo contro valori di eta non validi
+        return 0.0
+    if eta1 <= 1.0 or eta2 <= 0.0 or lambda_S < 0.0 or not (0.0 < p_up < 1.0):
+        return 0.0
+
+    def MY(theta):
+        return p_up * (eta1 / (eta1 - theta)) + (1.0 - p_up) * (eta2 / (eta2 + theta))
+
+    def F(theta):
+        if (theta <= -eta2 + 1e-12) or (theta >= eta1 - 1.0 - 1e-12):
+            return np.sign(theta) * 1e6
+        try:
+            return lambda_S * (MY(theta + 1.0) - MY(theta)) - drift_target
+        except Exception:
+            return np.sign(theta) * 1e6
+
+    a = -eta2 + 1e-6
+    b = eta1 - 1.0 - 1e-6
+    if a >= b:
+        a = -eta2 * 0.99
+        b = eta1 * 0.99 - 1.0
+        if a >= b:
+            return 0.0
+
+    try:
+        fa = F(a)
+        fb = F(b)
+        if not (np.isfinite(fa) and np.isfinite(fb)) or fa * fb > 0.0:
+            m = 0.5 * (a + b)
+            fa_m = F(a)
+            fm = F(m)
+            fb_m = F(b)
+            if np.isfinite(fa_m) and np.isfinite(fm) and fa_m * fm <= 0.0:
+                a2, b2 = a, m
+            elif np.isfinite(fm) and np.isfinite(fb_m) and fm * fb_m <= 0.0:
+                a2, b2 = m, b
+            else:
+                return 0.0
+            return float(brentq(F, a2, b2, xtol=tol, maxiter=max_iter))
+        return float(brentq(F, a, b, xtol=tol, maxiter=max_iter))
+    except Exception:
+        return 0.0
+
+def esscher_kou_parameters(lambda_S, p_up, eta1, eta2, drift_target):
+    theta = esscher_kou_theta(lambda_S, p_up, eta1, eta2, drift_target)
+    moment_0 = p_up * (eta1 / (eta1 - theta)) + (1.0 - p_up) * (eta2 / (eta2 + theta))         #funzione generatrice del momento di theta (controllare, 10/9)
+    if not np.isfinite(moment_0) or moment_0 <= 0:
+        return lambda_S, p_up, eta1, eta2, 0.0
+    lambda_Q = lambda_S * moment_0
+    p_num = p_up * (eta1 / (eta1 - theta))
+    p_up_Q = p_num / moment_0
+    eta1_Q = eta1 - theta
+    eta2_Q = eta2 + theta
+    return lambda_Q, p_up_Q, eta1_Q, eta2_Q, theta
+
+def extract_rnd_from_prices(strikes, prices, S0, T, r, q, grid_points):
+    strikes = np.asarray(strikes, dtype=float)
+    prices = np.asarray(prices, dtype=float)
+    grid_points = np.asarray(grid_points, dtype=float)
+    idx = np.argsort(strikes)
+    K_sorted = strikes[idx]
+    P_sorted = prices[idx]
+    if len(np.unique(K_sorted)) < 3:
+        return np.ones_like(grid_points) / float(len(grid_points))
+    try:
+        pchip = PchipInterpolator(K_sorted, P_sorted, extrapolate=True)
+        C_vals = pchip(grid_points)
+        steps = np.diff(grid_points)
+        if np.any(np.abs(steps - steps[0]) > 1e-8):
+            # Non-uniform grid; approximate using local steps
+            n = len(grid_points)
+            dens = np.zeros(n)
+            for i in range(n):
+                if 0 < i < n-1:
+                    h1 = grid_points[i] - grid_points[i-1]
+                    h2 = grid_points[i+1] - grid_points[i]
+                    C_im1 = C_vals[i-1]
+                    C_i = C_vals[i]
+                    C_ip1 = C_vals[i+1]
+                    denom = 0.5 * (h1 + h2)
+                    if denom == 0:
+                        second_deriv = 0.0
+                    else:
+                        second_deriv = 2.0 * ( (C_ip1 - C_i)/h2 - (C_i - C_im1)/h1 ) / (h1 + h2 )
+                    dens[i] = np.exp(r * T) * max(second_deriv, 0.0)
+                else:
+                    dens[i] = 0.0
+        else:
+            step = steps[0] if len(steps) > 0 else 1.0
+            n = len(grid_points)
+            dens = np.zeros(n)
+            for i in range(1, n-1):
+                dens[i] = np.exp(r * T) * max((C_vals[i+1] - 2.0*C_vals[i] + C_vals[i-1]) / (step*step), 0.0)
+            dens[0]  = dens[1]
+            dens[-1] = dens[-2]
+        total = np.trapz(dens, grid_points)
+        if total > 0:
+            dens = dens / total
+        else:
+            dens = np.ones_like(dens) / float(len(dens))
+        return dens
+    except Exception:
+        return np.ones_like(grid_points) / float(len(grid_points))
+
+
+def sinkhorn_distance(a, b, cost_matrix, eps=1e-3, max_iter=200, tol=1e-9):        #settare tolleranza a 1e-9
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    a = np.maximum(a, 0.0)
+    b = np.maximum(b, 0.0)
+    a = a / (np.sum(a) + 1e-16)
+    b = b / (np.sum(b) + 1e-16)
+    # Kernel for Sinkhorn iterations
+    K = np.exp(-cost_matrix / max(eps, 1e-12))
+    u = np.ones_like(a)
+    v = np.ones_like(b)
+    for _ in range(max_iter):
+        u_prev = u.copy()
+        K_v = K @ v
+        K_v[K_v == 0] = 1e-16
+        u = a / K_v
+        K_T_u = K.T @ u
+        K_T_u[K_T_u == 0] = 1e-16
+        v = b / K_T_u
+        if np.linalg.norm(u - u_prev, 1) < tol:
+            break
+    transport_plan = np.outer(u, v) * K
+    return float(np.sum(transport_plan * cost_matrix))
+
+# ====================================================================== #
 
 def kou_one_shot_Y(N, p_up, eta1, eta2, rng):
     if N <= 0:
@@ -347,13 +522,291 @@ def sfv_qe_kou_paths_vec(S0, T, r, q, kappa, theta, v0, xi, rho, gamma, lambda_S
         S_arr *= np.exp(drift + diff)
         v_arr = v_nxt
 
-    return S_arr, v_arr       #La nuova versione simula il prezzo terminale dell'asset e la sua varianza per tutti i percorsi MC simultaneamente, utilizzando la vettorizzazione numpy.
+    return S_arr, v_arr
+# ================== NUOVA IMPLENETAZIONE LIVELLI 0, 1, 2 ==== #
 
-def sfv_qe_kou_paths(S0, T, r, q,
-                     kappa, theta, v0, xi, rho, gamma,
-                     lambda_S, p_up, eta1, eta2,
-                     lambda_V, mu_J_V, sigma_J_V,
-                     N=50, M=8000, rng=None, use_antithetic=True):
+def sfv_affine_qe_kou_paths_vec(S0, T, r, q, kappa, theta, v0, xi, rho, gamma, lambda_S, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V, N=50, M=8000, rng=None, use_antithetic=True):
+    if rng is None:
+        rng = np.random.default_rng(42)
+    sigma_eff, rho_eff = sfv_sigma_rho_eff(xi, rho, gamma)
+
+    N_int = int(max(1, N))
+    M_int = int(max(1, M))
+    dt = T / float(N_int)
+
+    M_eff = (M_int // 2) * 2 if use_antithetic else M_int
+    half = M_eff // 2 if use_antithetic else M_eff
+
+    S_arr = np.full(M_eff, float(S0))
+    v_arr = np.full(M_eff, float(v0))
+    v_floor = 1e-8
+
+    sqrt_1mr2 = np.sqrt(max(1.0 - rho_eff*rho_eff, 0.0))
+    # compensatore Kou (E[e^Y]-1)
+    Ey = p_up * (eta1 / (eta1 - 1.0)) + (1.0 - p_up) * (eta2 / (eta2 + 1.0))
+    comp_S = lambda_S * (Ey - 1.0)
+
+    for _ in range(N_int):
+        Z1_half = rng.standard_normal(half)
+        Z2i_half = rng.standard_normal(half)
+        if use_antithetic:
+            Z1 = np.concatenate([Z1_half,  -Z1_half])
+            Z2i = np.concatenate([Z2i_half, -Z2i_half])
+        else:
+            Z1, Z2i = Z1_half, Z2i_half
+        Z2 = rho_eff * Z1 + sqrt_1mr2 * Z2i
+        v_prev = np.maximum(v_arr, v_floor)
+        e_kdt = np.exp(-kappa * dt)
+        m = theta + (v_prev - theta) * e_kdt
+        s2 = v_prev * sigma_eff * sigma_eff * e_kdt * (1.0 - e_kdt) / kappa \
+             + theta * sigma_eff * sigma_eff * (1.0 - e_kdt)**2 / (2.0 * kappa)
+        s2 = np.maximum(s2, 1e-12)
+        psi = s2 / (m * m + 1e-12)
+
+        v_nxt = np.empty_like(v_prev)
+        mask_A = psi <= 1.5
+        if np.any(mask_A):
+            psiA = psi[mask_A]; mA = m[mask_A]
+            b2 = 2.0/psiA - 1.0 + np.sqrt(np.maximum(2.0/psiA * (2.0/psiA - 1.0), 0.0))
+            b2 = np.maximum(b2, 0.0)
+            a = mA / (1.0 + b2)
+            v_nxt[mask_A] = a * (np.sqrt(b2) + Z2[mask_A])**2
+            v_nxt[mask_A] = np.maximum(v_nxt[mask_A], v_floor)
+        mask_B = ~mask_A
+        if np.any(mask_B):
+            psiB = psi[mask_B]; mB = m[mask_B]
+            pB = (psiB - 1.0) / (psiB + 1.0)
+            pB = np.clip(pB, 0.0, 0.99)
+            betaB = (1.0 - pB) / (mB + 1e-12)
+            U = rng.random(pB.shape)
+            exp_draws = rng.exponential(1.0 / (betaB + 1e-12))
+            v_tmp = np.where(U <= pB, v_floor, np.maximum(exp_draws, v_floor))
+            v_nxt[mask_B] = v_tmp
+
+        # salti in v (spettro-positivi, lognormali composti)
+        if lambda_V > 0.0:
+            nV = rng.poisson(lambda_V * dt, size=M_eff)
+            maskV = nV > 0
+            if np.any(maskV):
+                J_log = rng.normal(mu_J_V * nV[maskV], sigma_J_V * np.sqrt(nV[maskV]))
+                v_nxt[maskV] *= np.exp(J_log)
+
+        # log S: drift con compensatore fisso
+        drift = (r - q - comp_S - 0.5 * v_prev) * dt
+        diff = np.sqrt(np.maximum(v_prev * dt, 0.0)) * Z1
+
+        if lambda_S > 0.0:
+            nS = rng.poisson(lambda_S * dt, size=M_eff)
+            if np.any(nS > 0):
+                n_up = rng.binomial(nS, p_up)
+                n_dn = nS - n_up
+                up_jump = rng.gamma(shape=np.maximum(n_up,0), scale=1.0/eta1)
+                dn_jump = rng.gamma(shape=np.maximum(n_dn,0), scale=1.0/eta2)
+                diff += (up_jump - dn_jump)
+
+        S_arr *= np.exp(drift + diff)
+        v_arr = np.maximum(v_nxt, v_floor)
+
+    return S_arr, v_arr       #Livello 0 (core affine): feedback riassorbito in (sigma_eff, rho_eff).
+
+def sfv_affine_level1_paths_vec(S0, T, r, q, kappa, theta, v0, xi, rho, gamma, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V, a0, a1, a2, kappa_lambda, lambda_bar, alpha_hawkes, N=50, M=8000, rng=None, use_antithetic=True):
+    if rng is None:
+        rng = np.random.default_rng(42)
+    sigma_eff, rho_eff = sfv_sigma_rho_eff(xi, rho, gamma)
+
+    N_int = int(max(1, N))
+    M_int = int(max(1, M))
+    dt = T / float(N_int)
+
+    M_eff = (M_int // 2) * 2 if use_antithetic else M_int
+    half = M_eff // 2 if use_antithetic else M_eff
+
+    S_arr = np.full(M_eff, float(S0))
+    v_arr = np.full(M_eff, float(v0))
+    lam_arr = np.full(M_eff, float(max(lambda_bar, 1e-8)))
+    v_floor = 1e-8
+
+    sqrt_1mr2 = np.sqrt(max(1.0 - rho_eff*rho_eff, 0.0))
+    Ey = p_up * (eta1 / (eta1 - 1.0)) + (1.0 - p_up) * (eta2 / (eta2 + 1.0))
+
+    for _ in range(N_int):
+        Z1_half = rng.standard_normal(half)
+        Z2i_half = rng.standard_normal(half)
+        if use_antithetic:
+            Z1 = np.concatenate([Z1_half,  -Z1_half])
+            Z2i = np.concatenate([Z2i_half, -Z2i_half])
+        else:
+            Z1, Z2i = Z1_half, Z2i_half
+        Z2 = rho_eff * Z1 + sqrt_1mr2 * Z2i
+
+        v_prev = np.maximum(v_arr,  v_floor)
+        lam_prev = np.maximum(lam_arr, 1e-12)
+
+        e_kdt = np.exp(-kappa * dt)
+        m = theta + (v_prev - theta) * e_kdt
+        s2 = v_prev * sigma_eff * sigma_eff * e_kdt * (1.0 - e_kdt) / kappa \
+             + theta * sigma_eff * sigma_eff * (1.0 - e_kdt)**2 / (2.0 * kappa)
+        s2 = np.maximum(s2, 1e-12)
+        psi = s2 / (m * m + 1e-12)
+
+        v_nxt = np.empty_like(v_prev)
+        mask_A = psi <= 1.5
+        if np.any(mask_A):
+            psiA = psi[mask_A]; mA = m[mask_A]
+            b2 = 2.0/psiA - 1.0 + np.sqrt(np.maximum(2.0/psiA * (2.0/psiA - 1.0), 0.0))
+            b2 = np.maximum(b2, 0.0)
+            a = mA / (1.0 + b2)
+            v_nxt[mask_A] = a * (np.sqrt(b2) + Z2[mask_A])**2
+            v_nxt[mask_A] = np.maximum(v_nxt[mask_A], v_floor)
+        mask_B = ~mask_A
+        if np.any(mask_B):
+            psiB = psi[mask_B]; mB = m[mask_B]
+            pB = (psiB - 1.0) / (psiB + 1.0)
+            pB = np.clip(pB, 0.0, 0.99)
+            betaB = (1.0 - pB) / (mB + 1e-12)
+            U = rng.random(pB.shape)
+            exp_draws = rng.exponential(1.0 / (betaB + 1e-12))
+            v_tmp = np.where(U <= pB, v_floor, np.maximum(exp_draws, v_floor))
+            v_nxt[mask_B] = v_tmp
+
+        if lambda_V > 0.0:
+            nV = rng.poisson(lambda_V * dt, size=M_eff)
+            maskV = nV > 0
+            if np.any(maskV):
+                J_log = rng.normal(mu_J_V * nV[maskV], sigma_J_V * np.sqrt(nV[maskV]))
+                v_nxt[maskV] *= np.exp(J_log)
+
+        lamS_t = a0 + a1*lam_prev + a2*v_prev
+        lamS_t = np.maximum(lamS_t, 0.0)
+        comp_S_t = lamS_t * (Ey - 1.0)
+
+        drift = (r - q - comp_S_t - 0.5 * v_prev) * dt
+        diff = np.sqrt(np.maximum(v_prev * dt, 0.0)) * Z1
+
+        nS = rng.poisson(lamS_t * dt)
+        maskS = nS > 0
+        if np.any(maskS):
+            n_up = rng.binomial(nS[maskS], p_up)
+            n_dn = nS[maskS] - n_up
+            up_jump = np.zeros_like(diff[maskS])
+            dn_jump = np.zeros_like(diff[maskS])
+            m_up = n_up > 0; m_dn = n_dn > 0
+            if np.any(m_up): up_jump[m_up] = rng.gamma(shape=n_up[m_up], scale=1.0/eta1)
+            if np.any(m_dn): dn_jump[m_dn] = rng.gamma(shape=n_dn[m_dn], scale=1.0/eta2)
+            diff[maskS] += (up_jump - dn_jump)
+
+        S_arr *= np.exp(drift + diff)
+        v_arr = np.maximum(v_nxt, v_floor)
+
+        # aggiornamento lambda_t (OU/Hawkes exp. Markov)
+        lam_arr = lam_prev + kappa_lambda*(lambda_bar - lam_prev)*dt + alpha_hawkes * nS.astype(float)
+
+    return S_arr, v_arr, lam_arr       #Livello 1 (affine esteso): stato aumentato con lambda_t (clustering), compensatore dei salti affine in (lambda_t, v_t).
+
+def default_kou_jump_sampler(rng, nS_array, p_up, eta1, eta2):
+    nS_array = np.asarray(nS_array, int)
+    out = np.zeros_like(nS_array, dtype=float)
+    mask = nS_array > 0
+    if np.any(mask):
+        nS = nS_array[mask]
+        n_up = rng.binomial(nS, p_up)
+        n_dn = nS - n_up
+        inc = np.zeros_like(nS, dtype=float)
+        m_up = n_up > 0; m_dn = n_dn > 0
+        if np.any(m_up): inc[m_up] += rng.gamma(shape=n_up[m_up], scale=1.0/eta1)
+        if np.any(m_dn): inc[m_dn] -= rng.gamma(shape=n_dn[m_dn], scale=1.0/eta2)
+        out[mask] = inc
+    return out
+
+
+def sfv_level2_paths_vec(S0, T, r, q, kappa, theta, v0, xi, rho, gamma, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V, intensity_fn=None, jump_law_sampler=None, N=50, M=8000, rng=None, use_antithetic=True):
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    N_int = int(max(1, N))
+    M_int = int(max(1, M))
+    dt = T / float(N_int)
+
+    M_eff = (M_int // 2) * 2 if use_antithetic else M_int
+    half = M_eff // 2 if use_antithetic else M_eff
+
+    S_arr = np.full(M_eff, float(S0))
+    v_arr = np.full(M_eff, float(v0))
+    v_floor = 1e-8
+
+    sqrt_1mr2 = np.sqrt(max(1.0 - rho**2, 0.0))
+
+    for step in range(N_int):
+        Z1_half  = rng.standard_normal(half)
+        Z2i_half = rng.standard_normal(half)
+        if use_antithetic:
+            Z1  = np.concatenate([Z1_half,  -Z1_half])
+            Z2i = np.concatenate([Z2i_half, -Z2i_half])
+        else:
+            Z1, Z2i = Z1_half, Z2i_half
+        Z2 = rho * Z1 + sqrt_1mr2 * Z2i
+
+        v_prev = np.maximum(v_arr, v_floor)
+        e_kdt = np.exp(-kappa * dt)
+        m = theta + (v_prev - theta) * e_kdt
+        s2 = v_prev * xi * xi * e_kdt * (1.0 - e_kdt) / kappa \
+             + theta * xi * xi * (1.0 - e_kdt)**2 / (2.0 * kappa)
+        s2 = np.maximum(s2, 1e-12)
+        psi = s2 / (m*m + 1e-12)
+
+        v_nxt = np.empty_like(v_prev)
+        mask_A = psi <= 1.5
+        if np.any(mask_A):
+            psiA = psi[mask_A]; mA = m[mask_A]
+            b2 = 2.0/psiA - 1.0 + np.sqrt(np.maximum(2.0/psiA * (2.0/psiA - 1.0), 0.0))
+            b2 = np.maximum(b2, 0.0)
+            a = mA / (1.0 + b2)
+            v_nxt[mask_A] = a * (np.sqrt(b2) + Z2[mask_A])**2
+            v_nxt[mask_A] = np.maximum(v_nxt[mask_A], v_floor)
+        mask_B = ~mask_A
+        if np.any(mask_B):
+            psiB = psi[mask_B]; mB = m[mask_B]
+            pB = (psiB - 1.0) / (psiB + 1.0)
+            pB = np.clip(pB, 0.0, 0.99)
+            betaB = (1.0 - pB) / (mB + 1e-12)
+            U = rng.random(pB.shape)
+            exp_draws = rng.exponential(1.0 / (betaB + 1e-12))
+            v_tmp = np.where(U <= pB, v_floor, np.maximum(exp_draws, v_floor))
+            v_nxt[mask_B] = v_tmp
+
+        if lambda_V > 0.0:
+            nV = rng.poisson(lambda_V * dt, size=M_eff)
+            maskV = nV > 0
+            if np.any(maskV):
+                J_log = rng.normal(mu_J_V * nV[maskV], sigma_J_V * np.sqrt(nV[maskV]))
+                v_nxt[maskV] *= np.exp(J_log)
+
+        v_avg = 0.5 * (v_prev + v_nxt)
+        I = np.maximum(v_avg * dt, 0.0)
+        v_nxt = np.maximum(v_nxt + gamma * np.sqrt(I) * Z1, v_floor)
+
+        if intensity_fn is not None:
+            lamS_t = np.maximum(np.asarray(intensity_fn(step*dt, S_arr, v_prev), float), 0.0)
+            Ey = p_up * (eta1 / (eta1 - 1.0)) + (1.0 - p_up) * (eta2 / (eta2 + 1.0))
+            comp_S_t = lamS_t * (Ey - 1.0)
+        else:
+            lamS_t = np.zeros_like(S_arr)
+            comp_S_t = np.zeros_like(S_arr)
+
+        drift = (r - q - comp_S_t - 0.5 * v_prev) * dt
+        diff  = np.sqrt(np.maximum(v_prev * dt, 0.0)) * Z1
+
+        if jump_law_sampler is not None:
+            nS = rng.poisson(lamS_t * dt)
+            diff += jump_law_sampler(rng, nS, p_up, eta1, eta2)
+
+        S_arr *= np.exp(drift + diff)
+        v_arr  = v_nxt
+
+    return S_arr, v_arr        #Livello 2 (non-affine, locale): feedback esplicito, ma consente intensità/leggi di salto state-dependent via callable opzionali (modificare il codice per leggere meglio la dinamica).
+
+# ============================================================================= #
+def sfv_qe_kou_paths(S0, T, r, q, kappa, theta, v0, xi, rho, gamma, lambda_S, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V, N=50, M=8000, rng=None, use_antithetic=True):
     if rng is None:
         rng = np.random.default_rng(42)
 
@@ -364,38 +817,33 @@ def sfv_qe_kou_paths(S0, T, r, q,
 
     sqrt_1mr2 = np.sqrt(max(1.0 - rho*rho, 0.0))
     v_floor = 1e-8
-    # compensatore Kou (drift jump-diffusion)
-    Ey = p_up * (eta1/(eta1 - 1.0)) + (1.0 - p_up) * (eta2/(eta2 + 1.0))  # E[e^Y]
-    comp_S = lambda_S * (Ey - 1.0)                                        # λ(E[e^Y]-1)
+    Ey = p_up * (eta1/(eta1 - 1.0)) + (1.0 - p_up) * (eta2/(eta2 + 1.0))
+    comp_S = lambda_S * (Ey - 1.0)
 
     def _one_path(anti=False):
         S = float(S0); v = float(v0)
         for _ in range(int(N)):
-            Z1  = rng.standard_normal()
+            Z1 = rng.standard_normal()
             Z2i = rng.standard_normal()
             if anti:
                 Z1, Z2i = -Z1, -Z2i
             Z2 = rho * Z1 + sqrt_1mr2 * Z2i
 
-            # QE step per v
             v_cur = max(v, v_floor)
             v_nxt = _qe_variance_step(v_cur, dt, kappa, theta, xi, Z2, rng)
 
-            # salti lognormali in v
             if lambda_V > 0.0:
                 nV = rng.poisson(lambda_V * dt)
                 if nV > 0:
                     J_log = rng.normal(mu_J_V * nV, sigma_J_V * np.sqrt(nV))
                     v_nxt *= np.exp(J_log)
 
-            # feedback gamma
             v_avg = 0.5 * (v_cur + v_nxt)
             I = max(v_avg * dt, 0.0)
             v_nxt = max(v_nxt + gamma * np.sqrt(I) * Z1, v_floor)
 
-            # dinamica log S
             drift = (r - q - comp_S - 0.5 * v_cur) * dt
-            diff  = np.sqrt(max(v_cur*dt, 0.0)) * Z1
+            diff = np.sqrt(max(v_cur*dt, 0.0)) * Z1
 
             if lambda_S > 0.0:
                 nS = rng.poisson(lambda_S * dt)
@@ -413,14 +861,13 @@ def sfv_qe_kou_paths(S0, T, r, q,
 
     j = 0
     while j < M_eff:
-        S_out[j],  v_out[j]  = _one_path(False); j += 1
+        S_out[j], v_out[j]  = _one_path(False); j += 1
         if use_antithetic and j < M_eff:
-            S_out[j],  v_out[j]  = _one_path(True);  j += 1
+            S_out[j], v_out[j]  = _one_path(True);  j += 1
 
     return S_out, v_out
 
-def compute_sfv_prices_vectorized(p, S, r, q, T, strikes,
-                                  N_step=None, M=8000, rng=None):
+def compute_sfv_prices_vectorized(p, S, r, q, T, strikes, N_step=None, M=8000, rng=None, option_type: str = "call", level: int = 2, a0=None, a1=None, a2=None, kappa_lambda=None, lambda_bar=None, alpha_hawkes=None, intensity_fn=None, jump_law_sampler=None):
     kappa, theta, v0, xi, gamma, lambda_S, p_up, eta1, eta2, \
     lambda_V, mu_J_V, sigma_J_V, rho = p
 
@@ -429,14 +876,33 @@ def compute_sfv_prices_vectorized(p, S, r, q, T, strikes,
     if N_step is None:
         N_step = max(10, int(T*252/3))
 
-    # leverage the vectorised simulation for efficiency
-    S_T, _ = sfv_qe_kou_paths_vec(S, T, r, q, kappa, theta, v0, xi, rho, gamma,
-                                  lambda_S, p_up, eta1, eta2,
-                                  lambda_V, mu_J_V, sigma_J_V,
-                                  N=N_step, M=M, rng=rng)
+    if level == 0:
+        S_T, _ = sfv_affine_qe_kou_paths_vec(S, T, r, q, kappa, theta, v0, xi, rho, gamma, lambda_S, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V, N=N_step, M=M, rng=rng)
+    elif level == 1:
+        missing = [x is None for x in (a0, a1, a2, kappa_lambda, lambda_bar, alpha_hawkes)]
+        if any(missing):
+            raise ValueError("Livello 1 richiede: a0, a1, a2, kappa_lambda, lambda_bar, alpha_hawkes.")
+        S_T, _, _ = sfv_affine_level1_paths_vec(S, T, r, q, kappa, theta, v0, xi, rho, gamma, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V, a0, a1, a2, kappa_lambda, lambda_bar, alpha_hawkes, N=N_step, M=M, rng=rng)
+    elif level == 2:
+        S_T, _ = sfv_qe_kou_paths_vec(S, T, r, q, kappa, theta, v0, xi, rho, gamma, lambda_S, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V, N=N_step, M=M, rng=rng)
+        if (intensity_fn is not None) or (jump_law_sampler is not None):
+            S_T, _ = sfv_level2_paths_vec(S, T, r, q, kappa, theta, v0, xi, rho, gamma, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V, intensity_fn=intensity_fn, jump_law_sampler=jump_law_sampler, N=N_step, M=M, rng=rng)
+    else:
+        raise ValueError("level deve essere 0 (affine), 1 (affine esteso) o 2 (non-affine, default).")
 
-    pay = np.maximum(S_T[:, None] - strikes[None, :], 0.0)
-    return np.exp(-r * T) * pay.mean(axis=0)
+    strikes = np.atleast_1d(np.asarray(strikes, float))
+    STc = S_T.reshape(-1, 1)
+    Kc  = strikes.reshape(1, -1)
+
+    disc = np.exp(-r * T)
+    if option_type.lower() == "call":
+        pay = np.maximum(STc - Kc, 0.0)
+        return disc * pay.mean(axis=0)
+    elif option_type.lower() == "put":
+        pay = np.maximum(Kc - STc, 0.0)
+        return disc * pay.mean(axis=0)
+    else:
+        raise ValueError("option_type deve essere 'call' oppure 'put'.")
 
 # ---------- (A) RESIDUI & JACOBIANO CON CRN ----------
 def _sfv_residuals_prices(p, S, r, q, T, strikes, market_mid, w_pre,
