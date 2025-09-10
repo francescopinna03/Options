@@ -904,22 +904,14 @@ def compute_sfv_prices_vectorized(p, S, r, q, T, strikes, N_step=None, M=8000, r
     else:
         raise ValueError("option_type deve essere 'call' oppure 'put'.")
 
-# ---------- (A) RESIDUI & JACOBIANO CON CRN ----------
-def _sfv_residuals_prices(p, S, r, q, T, strikes, market_mid, w_pre,
-                          N_step=30, M=6000, seed=12345):
-    """Residui (pesati) sui prezzi: r_i = sqrt(w_i) * (model_i - market_i)."""
+# ---------- RESIDUI & JACOBIANO CON CRN ----------
+def _sfv_residuals_prices(p, S, r, q, T, strikes, market_mid, w_pre, N_step=30, M=6000, seed=12345):
     rng = np.random.default_rng(int(seed))
-    model = compute_sfv_prices_vectorized(p, S, r, q, T, strikes,
-                                          N_step=N_step, M=M, rng=rng)
+    model = compute_sfv_prices_vectorized(p, S, r, q, T, strikes, N_step=N_step, M=M, rng=rng)
     err = (model - market_mid)
     return np.sqrt(w_pre) * err  # shape (n_obs,)
 
 def _fd_jacobian(f_residuals, x, rel_eps=1e-4, seed=12345, max_tries=3):
-    """
-    Jacobiano via differenze finite centrali in spazi rumorosi:
-    - Common Random Numbers: stesso seed ad ogni perturbazione.
-    - Adatta lo step se compaiono NaN/inf.
-    """
     x = np.asarray(x, float)
     f0 = f_residuals(x, seed=seed)
     m = f0.size
@@ -977,21 +969,21 @@ def svd_fisher_diagnostics(p, S, r, q, T, strikes, market_mid, w_pre, N_step=30,
 
 # ----------------------------------------------------------------------------------------------- #
 
-# ------------ Funzione in corso di sviluppo - Tikhonov direzionale da SFV ------------ #
+# ------------ Funzione in corso di sviluppo - Tikhonov direzionale da SFV (risposta soddisfacente dai test) ------------ #
 
 class SVDDirectionalTikhonov:
     def __init__(self, Vt, S, z0, tau=1e-2, beta=1e-3):
         self.Vt = np.asarray(Vt, float)
-        self.S  = np.asarray(S,  float)
+        self.S = np.asarray(S,  float)
         self.z0 = np.asarray(z0, float)
         smax = float(self.S[0])
         ratio = self.S / max(smax, 1e-12)
         w = np.where(ratio < float(tau), (smax/np.maximum(self.S,1e-12)), 0.0)
-        self.W = w  # pesi per-coefficiente nello spazio delle SV
+        self.W = w
 
     def penalty(self, z):
         v = np.asarray(z, float) - self.z0
-        coeff = self.Vt @ v                 # coordinate lungo le direzioni singolari
+        coeff = self.Vt @ v                 # coordinate lungo le direzioni singolari (verificato)
         return float(np.sum((self.W * coeff)**2))
 
 def obj_sfv_improved(p, S, r, q, T, strikes, market_mid, iv_mkt=None, adaptive_weights=True, regularization_strength=0.02):
@@ -1042,48 +1034,47 @@ def sfv_p_to_z(p):
 
     tau = np.log(2.0) / max(kappa, 1e-8)
 
-    zeta = xi / np.sqrt(max(theta, 1e-12))          # xi = zeta * sqrt(theta)
-    r0   = v0 / max(theta, 1e-12)                   # v0 = r0 * theta
+    zeta = xi / np.sqrt(max(theta, 1e-12))
+    r0 = v0 / max(theta, 1e-12)
 
     z = np.zeros(13, float)
-    z[0]  = np.log(theta)                           # >0
-    z[1]  = np.log(tau)                             # >0
-    z[2]  = np.log(zeta)                            # >0
-    z[3]  = np.log(r0)                              # >0
-    z[4]  = gamma                                   # R
-    z[5]  = np.log(max(lS, 1e-12))                  # >0
-    z[6]  = _logit(pup, 0.01, 0.99)                 # (0,1)
-    z[7]  = np.log(max(e1-1.0, 1e-6))               # eta1 > 1  => z>0
-    z[8]  = np.log(max(e2, 1e-8))                   # eta2 > 0
-    z[9]  = np.log(max(lV, 1e-12))                  # >0
-    z[10] = muJV                                     # R
-    z[11] = np.log(max(sJV, 1e-8))                  # >0
+    z[0] = np.log(theta) 
+    z[1] = np.log(tau)
+    z[2] = np.log(zeta)
+    z[3] = np.log(r0)
+    z[4] = gamma
+    z[5] = np.log(max(lS, 1e-12))
+    z[6] = _logit(pup, 0.01, 0.99)
+    z[7] = np.log(max(e1-1.0, 1e-6))
+    z[8] = np.log(max(e2, 1e-8))
+    z[9] = np.log(max(lV, 1e-12))
+    z[10] = muJV
+    z[11] = np.log(max(sJV, 1e-8))
     z[12] = np.arctanh(np.clip(rho, -0.999, 0.999)) # (-1,1)
     return z
 
 def sfv_z_to_p(z, enforce_feller_soft=True, feller_eps=0.98):
     z = np.asarray(z, float)
     theta = np.exp(z[0])
-    tau   = np.exp(z[1])
-    zeta  = np.exp(z[2])
-    r0    = np.exp(z[3])
+    tau = np.exp(z[1])
+    zeta = np.exp(z[2])
+    r0 = np.exp(z[3])
 
     kappa = np.log(2.0) / max(tau, 1e-10)
-    xi    = zeta * np.sqrt(theta)
-    v0    = r0 * theta
+    xi = zeta * np.sqrt(theta)
+    v0 = r0 * theta
 
     gamma = z[4]
-    lS    = np.exp(z[5])
-    pup   = _inv_logit(z[6], 0.01, 0.99)
-    e1    = 1.0 + np.exp(z[7])
-    e2    = np.exp(z[8])
-    lV    = np.exp(z[9])
-    muJV  = z[10]
-    sJV   = np.exp(z[11])
-    rho   = np.tanh(z[12])
+    lS = np.exp(z[5])
+    pup = _inv_logit(z[6], 0.01, 0.99)
+    e1 = 1.0 + np.exp(z[7])
+    e2 = np.exp(z[8])
+    lV = np.exp(z[9])
+    muJV = z[10]
+    sJV = np.exp(z[11])
+    rho = np.tanh(z[12])
 
-    # È introdotta una condizione di Feller “soft”: 2 kappa theta > xi^2. Se violato, ridimensiona xi.
-    # La condizione di Feller per CIR/Heston è classica.
+    # È introdotta una condizione di Feller “soft”: 2 kappa theta > xi^2 (per il modello heston-jump viene rispettata la Feller standard). Se violato, ridimensiona xi.
     if enforce_feller_soft and (xi*xi >= 2.0 * kappa * theta):
         xi = np.sqrt(feller_eps * 2.0 * kappa * theta)
 
@@ -1112,7 +1103,12 @@ except NameError:
 
 _CRN_SEEDSEQ = None  
 
-def obj_sfv_jump_qe(p, S, r, q, T, strikes, market_mid, iv_mkt=None, w_pre=None, liq_weights=None, vols_bounds=(1e-4, 5.0), N_step=50, M=8000, alpha=1.0, rng=None, reg_weights=None):
+def obj_sfv_jump_qe(p, S, r, q, T, strikes, market_mid,
+                    iv_mkt=None, w_pre=None, liq_weights=None,
+                    vols_bounds=(1e-4, 5.0), N_step=50, M=8000,
+                    alpha=1.0, rng=None, reg_weights=None,
+                    penalty_scale=0.0,
+                    sinkhorn_scale=0.0, sinkhorn_bins=30, sinkhorn_eps=1e-3):
     ss = globals().get("_CRN_SEEDSEQ", None)
     if ss is not None:
         rng = np.random.default_rng(ss)
@@ -1125,8 +1121,8 @@ def obj_sfv_jump_qe(p, S, r, q, T, strikes, market_mid, iv_mkt=None, w_pre=None,
         iv_mkt = np.asarray(iv_mkt, dtype=float)
 
     p = np.asarray(p, dtype=float).ravel()
-    if p.size != 13:
-        raise ValueError(f"Attesi 13 parametri, ricevuti {p.size}")       #debug dopo test 29/7
+    if p.size != 13 or not np.all(np.isfinite(p)):
+        return float(BIG_PENALTY)
 
     def _unpackA(pp):
         kappa, theta, v0, xi, rho,  gamma, lambda_S, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V = pp
@@ -1136,31 +1132,58 @@ def obj_sfv_jump_qe(p, S, r, q, T, strikes, market_mid, iv_mkt=None, w_pre=None,
         return kappa, theta, v0, xi, rho, gamma, lambda_S, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V
 
     pars = None
+    # Try orientation A: [kappa, theta, v0, xi, rho, gamma, lambda_S, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V]
     try:
         cand = _unpackA(p)
-        _rho, _pup, _e1, _e2 = cand[4], cand[7], cand[8], cand[9]
-        if (-0.999 <= _rho <= 0.999) and (0 < _pup < 1) and (_e1 > 1) and (_e2 > 0):
+        _kappa, _theta, _v0, _xi, _rho, _gamma, _lamS, _pup, _e1, _e2, _lamV, _muJV, _sigmaJV = cand
+        # Basic admissibility checks
+        if (0.0 < _kappa and 0.0 < _theta and 0.0 < _v0 and 0.0 < _xi and
+            -0.999 <= _rho <= 0.999 and 0.0 <= _lamS and 0.0 < _pup < 1.0 and
+            _e1 > 1.0 and _e2 > 0.0 and 0.0 <= _lamV and _sigmaJV >= 0.0 and
+            np.all(np.isfinite(cand))):
             pars = cand
     except Exception:
-        pass
+        pars = None
     if pars is None:
-        cand = _unpackB(p)
-        _rho, _pup, _e1, _e2 = cand[4], cand[7], cand[8], cand[9]
-        if not ((-0.999 <= _rho <= 0.999) and (0 < _pup < 1) and (_e1 > 1) and (_e2 > 0)):
-            raise ValueError("Impossibile interpretare l'ordinamento dei parametri p.")
-        pars = cand
+        try:
+            cand = _unpackB(p)
+            _kappa, _theta, _v0, _xi, _rho, _gamma, _lamS, _pup, _e1, _e2, _lamV, _muJV, _sigmaJV = cand
+            if (0.0 < _kappa and 0.0 < _theta and 0.0 < _v0 and 0.0 < _xi and
+                -0.999 <= _rho <= 0.999 and 0.0 <= _lamS and 0.0 < _pup < 1.0 and
+                _e1 > 1.0 and _e2 > 0.0 and 0.0 <= _lamV and _sigmaJV >= 0.0 and
+                np.all(np.isfinite(cand))):
+                pars = cand
+        except Exception:
+            pars = None
+    if pars is None:
+        return float(BIG_PENALTY)
 
     kappa, theta, v0, xi, rho, gamma, lambda_S, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V = pars
 
     fair = bool(globals().get("FAIR_COMPARE", False))
     alpha_eff = 1.0 if fair else float(alpha)
 
-    # Use vectorised simulation for efficiency
-    S_T, v_T = sfv_qe_kou_paths_vec(S0=S, T=T, r=r, q=q, kappa=kappa, theta=theta, v0=v0, xi=xi, rho=rho, gamma=gamma, lambda_S=lambda_S, p_up=p_up, eta1=eta1, eta2=eta2, lambda_V=lambda_V, mu_J_V=mu_J_V, sigma_J_V=sigma_J_V, N=N_step, M=M, rng=rng)
+    try:
+        drift_target = float(r - q - gamma * theta)
+        lambda_S_rn, p_up_rn, eta1_rn, eta2_rn, _theta_rn = esscher_kou_parameters(lambda_S, p_up, eta1, eta2, drift_target)
+        if not (np.isfinite(lambda_S_rn) and np.isfinite(p_up_rn) and np.isfinite(eta1_rn) and np.isfinite(eta2_rn)):
+            raise ValueError
+        if lambda_S_rn < 0.0 or not (0.0 < p_up_rn < 1.0) or eta1_rn <= 1.0 or eta2_rn <= 0.0:
+            raise ValueError
+    except Exception:
+        # Fallback: use physical parameters
+        lambda_S_rn, p_up_rn, eta1_rn, eta2_rn = lambda_S, p_up, eta1, eta2
+    try:
+        S_T, v_T = sfv_qe_kou_paths_vec(S0=S, T=T, r=r, q=q, kappa=kappa, theta=theta, v0=v0, xi=xi, rho=rho, gamma=gamma, lambda_S=lambda_S_rn, p_up=p_up_rn, eta1=eta1_rn, eta2=eta2_rn, lambda_V=lambda_V, mu_J_V=mu_J_V, sigma_J_V=sigma_J_V, N=N_step, M=M, rng=rng)
+        if (S_T.size == 0 or np.any(~np.isfinite(S_T)) or np.any(S_T <= 0.0)):
+            return float(BIG_PENALTY)
+    except Exception:
+        return float(BIG_PENALTY)        #penalità da definire
 
     payoffs = np.maximum(S_T[:, None] - strikes[None, :], 0.0)
     model_prices = np.exp(-r * T) * payoffs.mean(axis=0)
-
+    if np.any(~np.isfinite(model_prices)):
+        return float(BIG_PENALTY)
     if fair:
         w = np.ones_like(strikes, dtype=float)
     else:
@@ -1175,27 +1198,86 @@ def obj_sfv_jump_qe(p, S, r, q, T, strikes, market_mid, iv_mkt=None, w_pre=None,
                 w_liq = np.ones_like(w_vega)
             else:
                 w_liq = np.asarray(liq_weights, dtype=float)
-                w_liq = w_liq / (w_liq.mean() + 1e-12)
+                w_liq = w_liq / (np.mean(w_liq) + 1e-12)
             w = w_vega * w_liq
+    if not np.all(np.isfinite(w)):
+        return float(BIG_PENALTY)
 
     err_p = model_prices - market_mid
-    mse_price = (w * err_p * err_p).mean()
+    # Weighted MSE on prices
+    try:
+        mse_price = float(np.mean(w * err_p * err_p))
+    except Exception:
+        return float(BIG_PENALTY)
 
     mse_iv = 0.0
     if alpha_eff < 1.0:
-        iv_model = np.array([np.clip(bs_implied_vol_from_price(px, S, K, T, r, q), vols_bounds[0], vols_bounds[1]) for K, px in zip(strikes, model_prices)])
-        if iv_mkt is None:
-            iv_mkt = np.array([np.clip(bs_implied_vol_from_price(m, S, K, T, r, q), vols_bounds[0], vols_bounds[1]) for K, m in zip(strikes, market_mid)])
-        diff_iv = iv_model - iv_mkt
-        mse_iv = (diff_iv * diff_iv).mean()
+        # Compute model implied vols and market implied vols as needed
+        try:
+            iv_model = np.array([np.clip(bs_implied_vol_from_price(px, S, K, T, r, q), vols_bounds[0], vols_bounds[1]) for K, px in zip(strikes, model_prices)])
+            if iv_mkt is None:
+                iv_mkt = np.array([np.clip(bs_implied_vol_from_price(m, S, K, T, r, q), vols_bounds[0], vols_bounds[1]) for K, m in zip(strikes, market_mid)])
+            diff_iv = iv_model - iv_mkt
+            mse_iv = float(np.mean(diff_iv * diff_iv))
+        except Exception:
+            return float(BIG_PENALTY)
 
-    reg = 0.0                            #sezione di regolarizzazione (opzionale)
+    reg = 0.0
     if isinstance(reg_weights, dict):
-        reg += float(reg_weights.get("w_gamma",   0.0)) * (gamma    * gamma)
-        reg += float(reg_weights.get("w_lambdaS", 0.0)) * (lambda_S * lambda_S)
-        reg += float(reg_weights.get("w_lambdaV", 0.0)) * (lambda_V * lambda_V)
+        try:
+            reg += float(reg_weights.get("w_gamma",   0.0)) * (gamma * gamma)
+            reg += float(reg_weights.get("w_lambdaS", 0.0)) * (lambda_S * lambda_S)
+            reg += float(reg_weights.get("w_lambdaV", 0.0)) * (lambda_V * lambda_V)
+        except Exception:
+            reg += 0.0
 
-    loss = alpha_eff * mse_price + (1.0 - alpha_eff) * mse_iv + reg
+    per_strike_penalty = 0.0
+    if penalty_scale is not None and penalty_scale > 0.0:
+        try:
+            Fwd = S * np.exp((r - q) * T)
+            dist = np.abs(np.log(strikes / (Fwd + 1e-32)))
+            pen_levels = np.exp(-dist * dist)
+            pen_levels = pen_levels / (np.mean(pen_levels) + 1e-12)
+            per_strike_penalty = float(penalty_scale * np.mean(pen_levels * (err_p * err_p)))
+        except Exception:
+            per_strike_penalty = 0.0
+
+    sinkhorn_penalty = 0.0
+    if sinkhorn_scale is not None and sinkhorn_scale > 0.0 and strikes.size >= 5:
+        try:
+            S_min = np.max([1e-8, np.min(S_T), 0.5 * np.min(strikes)])
+            S_max = np.min([np.max(S_T), 2.0 * np.max(strikes)])
+            if not (np.isfinite(S_min) and np.isfinite(S_max)) or S_max <= S_min:
+                raise ValueError
+            nbins = max(3, int(sinkhorn_bins) + 1)
+            edges = np.linspace(S_min, S_max, nbins)
+            centers = 0.5 * (edges[:-1] + edges[1:])
+            hist_model_raw, _ = np.histogram(np.clip(S_T, S_min, S_max), bins=edges, density=False)
+            bin_widths = np.diff(edges)
+            hist_model = hist_model_raw / (np.sum(hist_model_raw) + 1e-16) / (bin_widths + 1e-16)
+            dens_market = extract_rnd_from_prices(strikes, market_mid, S, T, r, q, centers)
+            if len(dens_market) != len(hist_model):
+                x_mkt = np.linspace(np.min(centers), np.max(centers), len(dens_market))
+                dens_market = np.interp(centers, x_mkt, dens_market, left=dens_market[0], right=dens_market[-1])
+            eps_clip = 1e-12
+            hist_model = np.maximum(hist_model, eps_clip)
+            dens_market = np.maximum(dens_market, eps_clip)
+            hist_integral = np.trapz(hist_model, centers)
+            dens_integral = np.trapz(dens_market, centers)
+            hist_model = hist_model / (hist_integral + eps_clip)
+            dens_market = dens_market / (dens_integral + eps_clip)
+            if not (np.all(np.isfinite(hist_model)) and np.all(np.isfinite(dens_market))):
+                raise ValueError
+            log_centers = np.log(np.maximum(centers, 1e-12))
+            cost_matrix = (log_centers[:, None] - log_centers[None, :])**2
+            sk_dist = sinkhorn_distance(hist_model, dens_market, cost_matrix, eps=sinkhorn_eps, max_iter=200, tol=1e-9)
+            sinkhorn_penalty = float(sinkhorn_scale * sk_dist)
+        except Exception:
+            sinkhorn_penalty = 0.0
+
+    loss = alpha_eff * mse_price + (1.0 - alpha_eff) * mse_iv + reg + per_strike_penalty + sinkhorn_penalty
+    if not np.isfinite(loss):
+        return float(BIG_PENALTY)
     return float(loss)
 
 # ----------------------------------------------------------------------------------------------- #
