@@ -335,25 +335,31 @@ def sfv_price(p, S, r, q, T, strikes, N_step=None, M=8000, rng=None, option_type
     else:
         raise ValueError("option_type deve essere 'call' oppure 'put'.")
 
-def obj_sfv(p, S, r, q, T, strikes, market_mid, iv_mkt=None, w_pre=None, liq_weights=None, volatilities_bounds=(1e-4, 5.0), N_step=50, M=8000, alpha=1.0, rng=None, reg_weights=None, penalty_scale=0.0, sinkhorn_scale=0.0, sinkhorn_bins=30, sinkhorn_eps=1e-3):
+def obj_sfv(p, S, r, q, T, strikes, market_mid, iv_mkt=None, w_pre=None, liq_weights=None, volatilities_bounds=(1e-4, 5.0), N_step=50, M=8000, alpha=1.0, rng=None,
+    reg_weights=None, penalty_scale=0.0, sinkhorn_scale=0.0, sinkhorn_bins=30, sinkhorn_eps=1e-3, martingale_scale=0.0, feller_weight=0.0, atm_weight_scale=None,
+    penalty_mode='weight'):
     ss = globals().get("_CRN_SEEDSEQ", None)
     if ss is not None:
         rng = np.random.default_rng(ss)
     elif rng is None:
         rng = np.random.default_rng()
+
     strikes = np.asarray(strikes, dtype=float)
     market_mid = np.asarray(market_mid, dtype=float)
     if iv_mkt is not None:
         iv_mkt = np.asarray(iv_mkt, dtype=float)
+
     p = np.asarray(p, dtype=float).ravel()
     if p.size != 13 or not np.all(np.isfinite(p)):
         return float(BIG_PENALTY)
+
     def _unpackA(pp):
         kappa, theta, v0, xi, rho,  gamma, lambda_S, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V = pp
         return kappa, theta, v0, xi, rho, gamma, lambda_S, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V
     def _unpackB(pp):
         kappa, theta, v0, xi, gamma, lambda_S, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V, rho = pp
         return kappa, theta, v0, xi, rho, gamma, lambda_S, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V
+
     parameters = None
     try:
         cand = _unpackA(p)
@@ -378,19 +384,24 @@ def obj_sfv(p, S, r, q, T, strikes, market_mid, iv_mkt=None, w_pre=None, liq_wei
             parameters = None
     if parameters is None:
         return float(BIG_PENALTY)
+
     kappa, theta, v0, xi, rho, gamma, lambda_S, p_up, eta1, eta2, lambda_V, mu_J_V, sigma_J_V = parameters
+
     fair = bool(globals().get("FAIR_COMPARE", False))
     alpha_eff = 1.0 if fair else float(alpha)
+
     try:
         S_T, v_T = sfv_simulate_paths_vectorized(S0=S, T=T, r=r, q=q, kappa=kappa, theta=theta, v0=v0, xi=xi, rho=rho, gamma=gamma, lambda_S=lambda_S, p_up=p_up, eta1=eta1, eta2=eta2, lambda_V=lambda_V, mu_J_V=mu_J_V, sigma_J_V=sigma_J_V, N=N_step, M=M, rng=rng)
         if (S_T.size == 0 or np.any(~np.isfinite(S_T)) or np.any(S_T <= 0.0)):
             return float(BIG_PENALTY)
     except Exception:
         return float(BIG_PENALTY)
+
     payoffs = np.maximum(S_T[:, None] - strikes[None, :], 0.0)
     model_prices = np.exp(-r * T) * payoffs.mean(axis=0)
     if np.any(~np.isfinite(model_prices)):
         return float(BIG_PENALTY)
+
     if fair:
         w = np.ones_like(strikes, dtype=float)
     else:
@@ -407,13 +418,34 @@ def obj_sfv(p, S, r, q, T, strikes, market_mid, iv_mkt=None, w_pre=None, liq_wei
                 w_liq = np.asarray(liq_weights, dtype=float)
                 w_liq = w_liq / (np.mean(w_liq) + 1e-12)
             w = w_vega * w_liq
+    if (atm_weight_scale is not None) and (atm_weight_scale > 0.0) and (penalty_mode == 'weight'):
+        try:
+            Fwd = S * np.exp((r - q) * T)
+            dist = np.abs(np.log(strikes / (Fwd + 1e-32)))
+            pen_levels = np.exp(-dist * dist)
+            pen_levels = pen_levels / (np.mean(pen_levels) + 1e-12)
+            w = w * (1.0 + atm_weight_scale * pen_levels)
+        except Exception:
+            pass
     if not np.all(np.isfinite(w)):
         return float(BIG_PENALTY)
+
+    if (atm_weight_scale is not None) and (atm_weight_scale > 0.0) and (penalty_mode == 'weight'):
+        try:
+            Fwd = S * np.exp((r - q) * T)
+            dist = np.abs(np.log(strikes / (Fwd + 1e-32)))
+            pen_levels = np.exp(-dist ** 2) 
+            pen_levels = pen_levels / (np.mean(pen_levels) + 1e-12)
+            w = w * (1.0 + atm_weight_scale * pen_levels)
+        except Exception:
+            pass
+
     err_p = model_prices - market_mid
     try:
-        mse_price = float(np.mean(w * err_p * err_p))
+        mse_price = float(np.mean(w * err_p ** 2))
     except Exception:
         return float(BIG_PENALTY)
+
     mse_iv = 0.0
     if alpha_eff < 1.0:
         try:
@@ -424,25 +456,43 @@ def obj_sfv(p, S, r, q, T, strikes, market_mid, iv_mkt=None, w_pre=None, liq_wei
             mse_iv = float(np.mean(diff_iv * diff_iv))
         except Exception:
             return float(BIG_PENALTY)
+
     reg = 0.0
     if isinstance(reg_weights, dict):
         try:
-            reg += float(reg_weights.get("w_gamma",   0.0)) * (gamma * gamma)
-            reg += float(reg_weights.get("w_lambdaS", 0.0)) * (lambda_S * lambda_S)
-            reg += float(reg_weights.get("w_lambdaV", 0.0)) * (lambda_V * lambda_V)
+            reg += float(reg_weights.get("w_gamma",   0.0)) * (gamma ** 2)
+            reg += float(reg_weights.get("w_lambdaS", 0.0)) * (lambda_S ** 2)
+            reg += float(reg_weights.get("w_lambdaV", 0.0)) * (lambda_V ** 2)
         except Exception:
-            reg += 0.0
+            pass
+
     per_strike_penalty = 0.0
-    if penalty_scale is not None and penalty_scale > 0.0:
+    if penalty_mode == 'additive' and penalty_scale is not None and penalty_scale > 0.0:
         try:
             Fwd = S * np.exp((r - q) * T)
             dist = np.abs(np.log(strikes / (Fwd + 1e-32)))
-            pen_levels = np.exp(-dist * dist)
+            pen_levels = np.exp(-dist ** 2)
             pen_levels = pen_levels / (np.mean(pen_levels) + 1e-12)
-            per_strike_penalty = float(penalty_scale * np.mean(pen_levels * (err_p * err_p)))
+            per_strike_penalty = float(penalty_scale * np.mean(pen_levels * (err_p ** 2)))
         except Exception:
             per_strike_penalty = 0.0
-    loss = alpha_eff * mse_price + (1.0 - alpha_eff) * mse_iv + reg + per_strike_penalty
+
+    mart_pen = 0.0
+    if martingale_scale is not None and martingale_scale > 0.0:
+        disc_mean_ST = float(np.exp(-r * T) * np.mean(S_T))
+        target = float(S * np.exp(-q * T))
+        rel_dev = (disc_mean_ST - target) / (target + 1e-12)
+        mart_pen = float(martingale_scale * rel_dev ** 2)
+
+    feller_pen = 0.0
+    if feller_weight is not None and feller_weight > 0.0:
+        sigma_eff2 = xi*xi + gamma*gamma + 2.0*rho*xi*gamma
+        viol = max(0.0, sigma_eff2 - 2.0*kappa*theta)
+        # normalizzazione per scala
+        denom = 1.0 + 2.0*kappa*theta
+        feller_pen = float(feller_weight * (viol/denom) * (viol/denom))
+
+    loss = alpha_eff * mse_price + (1.0 - alpha_eff) * mse_iv + reg + per_strike_penalty + mart_pen + feller_pen
     if not np.isfinite(loss):
         return float(BIG_PENALTY)
     return float(loss)
@@ -574,8 +624,8 @@ def calibrate_sfv(ticker, maturity, r, q=0.0, method='differential_evolution', n
     rec_fine = ObjectiveRecorder(obj_sfv)
     reg_coarse = {'w_gamma': 0.01, 'w_lambdaS': 0.01, 'w_lambdaV': 0.01}
     reg_fine = {'w_gamma': 0.01, 'w_lambdaS': 0.01, 'w_lambdaV': 0.01}
-    args_coarse = (S, r, q, Ttm, strikes, market_prices, iv_mkt, w_pre, liq_weights, (1e-6, 3.0), N_step, M_coarse, 1.0, None, reg_coarse, 0.1, 0.05, 30, 1e-3)
-    args_fine = (S, r, q, Ttm, strikes, market_prices, iv_mkt, w_pre, liq_weights, (1e-6, 3.0), N_step, M_fine, 1.0, None, reg_fine, 0.1, 0.05, 30, 1e-3)
+    args_coarse = (S, r, q, Ttm, strikes, market_prices, iv_mkt, w_pre, liq_weights, (1e-6, 3.0), N_step, M_coarse, 1.0, None, reg_coarse, 0.0, 0.05, 30, 1e-3, 0.05, 100.0, 0.5,'weight')
+    args_fine = (S, r, q, Ttm, strikes, market_prices, iv_mkt, w_pre, liq_weights, (1e-6, 3.0), N_step, M_fine, 1.0, None, reg_fine, 0.0, 0.05, 30, 1e-3, 0.05, 150.0, 0.5, 'weight')
     it_de = {"k": 0}
     best_de_obj = float('inf')
     it_de = {"k": 0, "last_time": time.time()}
@@ -752,7 +802,7 @@ def _obj_sfv_multi(p, datasets, S0, r, q, alpha=1.0, seed=42, scale_by=1.0):
     losses = []
     for i, d in enumerate(datasets):
         rng_i = np.random.default_rng(seed + i)
-        loss = obj_sfv(p, S0, r, q, d['T'], d['strikes'], d['market_mid'], iv_mkt=d['iv_mkt'], w_pre=d['w_pre'], liq_weights=None, volatilities_bounds=(1e-6, 3.0), N_step=d['N_step'], M=d['M'], alpha=alpha, rng=rng_i, reg_weights={'w_gamma':0.01, 'w_lambdaS':0.01, 'w_lambdaV':0.01}, penalty_scale=0.1, sinkhorn_scale=0.05, sinkhorn_bins=30, sinkhorn_eps=1e-3)
+        loss = obj_sfv(p, S0, r, q, d['T'], d['strikes'], d['market_mid'],iv_mkt=d['iv_mkt'], w_pre=d['w_pre'], liq_weights=None,volatilities_bounds=(1e-6, 3.0),N_step=d['N_step'], M=d['M'], alpha=alpha, rng=rng_i,reg_weights={'w_gamma':0.01, 'w_lambdaS':0.01, 'w_lambdaV':0.01},penalty_scale=0.0, sinkhorn_scale=0.05, sinkhorn_bins=30, sinkhorn_eps=1e-3,martingale_scale=0.05,feller_weight=100.0,atm_weight_scale=0.5,penalty_mode='weight')
         losses.append(loss)
     return float(np.mean(losses)) / float(scale_by)
 
