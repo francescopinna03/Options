@@ -486,7 +486,7 @@ def obj_sfv(p, S, r, q, T, strikes, market_mid, iv_mkt=None, w_pre=None, liq_wei
 
     feller_pen = 0.0
     if feller_weight is not None and feller_weight > 0.0:
-        sigma_eff2 = xi*xi + gamma*gamma + 2.0*rho*xi*gamma
+        sigma_eff2 = xi**2 + gamma**2 + 2.0*rho*xi*gamma
         viol = max(0.0, sigma_eff2 - 2.0*kappa*theta)
         denom = 1.0 + 2.0*kappa*theta
         feller_pen = float(feller_weight * (viol/denom) * (viol/denom))
