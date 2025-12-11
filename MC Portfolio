@@ -4,15 +4,139 @@ import yfinance as yf
 import matplotlib.pyplot as plt
 from matplotlib import gridspec
 from scipy.stats import gaussian_kde, skew, kurtosis
+from scipy.optimize import minimize
 from matplotlib.colors import Normalize
 import datetime as dt
-import io
-from IPython.display import display
+from IPython.display import display, HTML
 import ipywidgets as widgets
+from arch import arch_model
+from sklearn.mixture import GaussianMixture
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.preprocessing import StandardScaler
+import warnings
+import plotly.graph_objects as go
+import plotly.io as pio
+from plotly.subplots import make_subplots
 
-def compute_cvar(vals, percentile=5):
-    cutoff = np.percentile(vals, percentile)
-    return vals[vals <= cutoff].mean()
+pio.renderers.default = "iframe"
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+warnings.filterwarnings("ignore", category=UserWarning) #check warning management
+
+COLOR_BG = '#121212'
+COLOR_TEXT = '#E0E0E0'
+COLOR_ACCENT_1 = '#008080'
+COLOR_ACCENT_2 = '#CC9500'
+COLOR_ACCENT_3 = '#C000C0'
+COLOR_GRID = '#333333'
+
+def compute_cvar(values, percentile=5):
+    values = np.asarray(values)
+    cutoff = np.percentile(values, percentile)
+    mask = valuss <= cutoff
+    if mask.sum() == 0:
+        return np.nan
+    return values[mask].mean()
+
+def compute_max_drawdown(path):
+    path = np.asarray(path)
+    cummax = np.maximum.accumulate(path)
+    drawdown = (path - cummax) / cummax
+    return drawdown.min()
+
+def fit_garch(returns, p=1, q=1):
+    try:
+        model = arch_model(returns * 100, vol='Garch', p=p, q=q, rescale=False)
+        res = model.fit(disp='off', show_warning=False)
+        forecast = res.forecast(horizon=1)
+        vol_forecast = np.sqrt(forecast.variance.values[-1, 0]) / 100.0
+        return res, vol_forecast
+    except Exception:
+        return None, returns.std()
+
+def simulate_student_t(mu, cov, df, n_samples):
+    mu = np.asarray(mu)
+    cov = np.asarray(cov)
+    d = len(mu)
+    z = np.random.multivariate_normal(np.zeros(d), cov, n_samples)
+    chi2 = np.random.chisquare(df, n_samples)
+    t_samples = z * np.sqrt(df / chi2)[:, None]
+    return mu + t_samples
+
+def detect_regimes_gmm(portfolio_returns, window=20, n_regimes=2, random_state=0):
+    rolling_vol = portfolio_returns.rolling(window=window).std()
+    rolling_ret = portfolio_returns.rolling(window=window).mean()
+
+    df_feat = pd.DataFrame({'ret': rolling_ret, 'vol': rolling_vol}).dropna()
+
+    if len(df_feat) < window * 2:
+        return None, None, None
+
+    scaler = StandardScaler()
+    X = scaler.fit_transform(df_feat.values)
+
+    gmm = GaussianMixture(n_components=n_regimes, covariance_type='full', random_state=random_state)
+    gmm.fit(X)
+    raw_states = gmm.predict(X)
+
+    vol_means = []
+    for k in range(n_regimes):
+        vol_means.append(df_feat['vol'][raw_states == k].mean())
+    order = np.argsort(vol_means)
+    mapping = {old: new for new, old in enumerate(order)}
+    states = np.array([mapping[s] for s in raw_states])
+
+    regime_series = pd.Series(states, index=df_feat.index)
+
+    regime_stats = {}
+    for reg in range(n_regimes):
+        mask = regime_series == reg
+        if mask.sum() > 5:
+            r_reg = portfolio_returns.loc[regime_series.index[mask]]
+            regime_stats[reg] = {'mean': r_reg.mean(), 'std': r_reg.std(), 'count': mask.sum(), 'prob': mask.sum() / len(regime_series)}
+
+    transitions = np.zeros((n_regimes, n_regimes))
+    values = states
+    for i in range(len(values) - 1):
+        transitions[values[i], values[i+1]] += 1
+    row_sums = transitions.sum(axis=1, keepdims=True)
+    transition_matrix = np.divide(transitions, row_sums, out=np.zeros_like(transitions), where=row_sums != 0)
+
+    return regime_series, regime_stats, transition_matrix
+
+def simulate_regime_switching(mu_dict, cov_dict, transition_matrix, weights, T, init_value=1.0, init_regime=0):
+
+    n_regimes = len(mu_dict)
+    path = np.zeros(T)
+    regimes_path = np.zeros(T, dtype=int)
+
+    path[0] = init_value
+    regimes_path[0] = init_regime
+
+    for t in range(1, T):
+        current_regime = regimes_path[t-1]
+        mu = mu_dict[current_regime]
+        cov = cov_dict[current_regime]
+
+        daily_vec = np.random.multivariate_normal(mu, cov)
+        port_ret = daily_vec.dot(weights)
+        path[t] = path[t-1] * (1.0 + port_ret)
+
+        probs = transition_matrix[current_regime]
+        if probs.sum() <= 0:
+            next_regime = current_regime
+        else:
+            next_regime = np.random.choice(n_regimes, p=probs)
+        regimes_path[t] = next_regime
+
+    return path, regimes_path
+
+
+
+
+
+
+
 
 def run_mc(stocks, weights, start, end, sims_n, T, init, rf):
     df = yf.download(stocks, start=start, end=end, auto_adjust=False, progress=False)['Close'].ffill()
