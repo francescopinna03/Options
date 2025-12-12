@@ -3,7 +3,7 @@ import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
 from matplotlib import gridspec
-from scipy.statistics import gaussian_kde, skew, kurtosis
+from scipy.stats import gaussian_kde, skew, kurtosis
 from scipy.optimize import minimize
 from matplotlib.colors import Normalize
 import datetime as dt
@@ -16,7 +16,7 @@ from sklearn.preprocessing import StandardScaler
 import warnings
 import plotly.graph_objects as go
 import plotly.io as pio
-from plotly.subplots import subplots
+from plotly.subplots import make_subplots
 import logging
 import contextlib
 import io
@@ -44,7 +44,7 @@ COLOR_GRID = '#333333'
 def compute_cvar(values, percentile=5):
     values = np.asarray(values)
     cutoff = np.percentile(values, percentile)
-    mask = valuss <= cutoff
+    mask = values <= cutoff
     if mask.sum() == 0:
         return np.nan
     return values[mask].mean()
@@ -167,7 +167,7 @@ def run_stress_test(tickers, weights, init_value, scenario_params):
     if isinstance(prices, pd.Series):
         prices = prices.to_frame(tickers[0])
     all_requested = list(tickers)
-    present_columnss = [c for c in prices.columns if c in all_requested]
+    present_columns = [c for c in prices.columns if c in all_requested]
     prices = prices[present_columns]
     prices = prices.ffill()
     all_nan_columns = [c for c in prices.columns if prices[c].isna().all()]
@@ -237,12 +237,12 @@ def efficient_frontier(mu, cov, n_points=50, rf=0.0425):
 
 def run_mc_analysis(tickers, weights, start, end, sims_n, T, init_value, rf, use_garch=True, use_student_t=True, df_student=5, use_regime_switching=False):
     try:
-        df_t-stud = int(df_student)
+        df_tstud= int(df_student)
     except (TypeError, ValueError):
-        df_t-stud = 5
-    if df_t-stud < 3:
-        df_t-stud = 5
-    df_student = df_t-stud
+        df_tstud= 5
+    if df_tstud< 3:
+        df_tstud= 5
+    df_student = df_tstud
 
     prices = yf_wrapper(tickers, start=start, end=end, auto_adjust=False, progress=False)['Close'].ffill()
 
@@ -424,7 +424,7 @@ def plots_2d(simulations, finals, max_drawdowns, cumulative_mean, stderr, init_v
 def plots_3d(simulations, finals):
     T, sims_n = simulations.shape
 
-    fig = 3d_subplots{rows=1, cols=3, specs=[[{"type": "surface"}, {"type": "scene"}, {"type": "scene"}]], subplot_titles=["Percentiles Evolatilityution Surface", "Risk-Return Space 3D", "Simulated Paths 3D"])
+    fig = make_subplots(rows=1, cols=3, specs=[[{"type": "surface"}, {"type": "scene"}, {"type": "scene"}]], subplot_titles=["Percentiles Evolution Surface","Risk-Return Space 3D", "Simulated Paths 3D"])    
     percentiles = [5, 25, 50, 75, 95]
     time_points = np.arange(T)
     Z = np.array([[np.percentile(simulations[t, :], p) for t in time_points] for p in percentiles])
@@ -553,76 +553,96 @@ def format_stats_horizontal(stats):
     html_str += "</div>"
     return html_str
 
-def on_run(_):
-    with out:
-        out.clear_output()
+def on_click_run(b):
+    out_res.clear_output()
+    with out_res:
+        tk = [x.strip().upper() for x in w_tickers.value.split(',') if x.strip()]
+        try:
+            wt = np.array([float(x) for x in w_weights.value.split(',')])
+        except ValueError:
+            display(HTML("<div style='color: red;'>ERROR: invalid weights format.</div>"))
+            return
 
-        tk = [t.strip().upper() for t in tickers_w.value.split(',')]
-        w = np.array([float(x) for x in weights_w.value.split(',')])
-        total_weight = w.sum()
-        if abs(total_weight - 1.0) > 1e-4:
-            raise ValueError(f"La somma dei pesi deve essere 1. Somma attuale = {total_weight:.4f}")
+        if len(wt) != len(tk):
+            display(HTML("<div style='color: red;'>ERROR: number of weights and tickers does not match.</div>"))
+            return
+        if abs(wt.sum() - 1.0) > 1e-6:
+            display(HTML(f"<div style='color: red;'>ERROR: weights must sum to 1. Current sum = {wt.sum():.4f}</div>"))
+            return
 
-        simulations, finals, (cumulative_mean, stderr), statistics = run_mc(tk, w, start_w.value, dt.date.today(), sims_w.value, T_w.value, init_w.value, rf_w.value)
+        display(HTML("<div style='color: #cc9500; font-family: monospace;'>[SYSTEM] PROCESSING SIMULATION...</div>"))
 
-        df = pd.DataFrame(statistics.items(), columns=['Statistica', 'Valore'])
-        sty = (df.style.format({'Valore': smart_val_format}).background_gradient('Blues', subset=['Valore']).set_table_styles([{'selector': 'th', 'props': [('background-color', '#003366'), ('color', 'white'),('font-size', '14px')]},{'selector': 'td', 'props': [('padding', '6px'), ('font-size', '13px')]}]).set_caption("Statistiche Monte Carlo"))
-        display(sty)
+        try:
+            res = run_mc_analysis(tk, wt, w_start.value, dt.date.today(), w_sims.value, w_T.value, w_init.value, w_rf.value, w_garch.value, w_student.value, w_df.value, w_regime.value)
+            sims, finals, max_dd, conv, stats, stress, frontier, (mu, cov), reg_info = res
+            display(HTML("<hr style='border-color: #333;'>"))
+            display(HTML(format_stats_horizontal(stats)))
+            display(HTML("<hr style='border-color: #333; margin-top: 20px; margin-bottom: 20px;'>"))
+            df_stress = pd.DataFrame(stress).T[['ret', 'dd', 'final']]
+            df_stress.columns = ['Return %', 'Max Drawdown %', 'Final Value']
+            df_stress = pd.DataFrame(stress).T[['ret', 'dd', 'final']]
+            df_stress.columns = ['Return %', 'Max Drawdown %', 'Final Value']
 
-        fig = plt.figure(figsize=(14, 7))
-        fig.canvas.header_visible = False
-        fig.canvas.toolbar_visible = True
-        fig.canvas.footer_visible = False
+            stress_style = (df_stress.style.format({'Return %': '{:.2f}%', 'Max Drawdown %': '{:.2f}%', 'Final Value': '{:,.0f}'}).set_table_attributes('class=\"dataframe\"'))
+            stress_html = stress_style.to_html()
+            display(HTML("<h4 style='color: #ff3333;'>SCENARIO STRESS TEST ANALYSIS</h4>" + stress_html))
+            missing_msgs = []
+            for scen_name, res_s in stress.items():
+                missing_tk = res_s.get("missing", [])
+                if missing_tk:
+                    missing_msgs.append((scen_name, missing_tk))
 
-        gs = gridspec.GridSpec(1, 2, width_ratios=[4, 0.9], wspace=0)
-        ax0 = fig.add_subplot(gs[0])
-        ax1 = fig.add_subplot(gs[1], sharey=ax0)
+            if missing_msgs:
+                msg_html = "<ul style='margin-top:5px; padding-left:18px;'>"
+                for scen_name, missing_tk in missing_msgs:
+                    msg_html += ("<li>"f"<strong>{scen_name}</strong>: ""IMPORTANT: analysis based on subset of assets; "f"no reliable data available for tickers {list(missing_tk)}""</li>")
+                msg_html += "</ul>"
 
-        cmap = plt.get_cmap('winter')
-        n = simulations.shape[1]
-        colors = [cmap(i / n) for i in range(n)]
+                display(HTML(
+                    "<div style='margin-top:8px; padding:8px; "
+                    "border:1px solid #cc9500; "
+                    "background-color:#1e1e1e; "
+                    "color:#cc9500; "
+                    "font-family: 'Roboto Mono', monospace; "
+                    "font-size:11px;'>"
+                    "<span style='font-weight:bold;'>STRESS TEST DATA NOTICE</span>"
+                    + msg_html +
+                    "</div>"
+                ))
+            if reg_info is not None:
+                display(HTML("<br><h4 style='color: #cc9500;'>REGIME SWITCHING DETAILS</h4>"))
+                t_mat = pd.DataFrame(reg_info['transition'], columns=['To Low', 'To High'], index=['From Low', 'From High'])
+                t_style = (t_mat.style.format("{:.2%}").set_table_attributes('class=\"dataframe\"'))
+                display(HTML(t_style.to_html()))
+            display(HTML("<br><h4 style='color: #008080;'>3D INTERACTIVE ANALYSIS</h4>"))
+            fig3d = plots_3d(sims, finals)
+            fig3d.show()
+            display(HTML("<br><h4 style='color: #008080;'>STATIC VISUALIZATIONS</h4>"))
+            plots_2d(sims, finals, max_dd, conv[0], conv[1], w_init.value, frontier, mu, cov, wt, tk)
 
-        for i in range(n):
-            ax0.plot(simulations[:, i], color=colors[i], alpha=0.35, lw=0.7)
-        ax0.grid(True, linestyle=':', linewidth=0.7, alpha=0.7)
+        except Exception as e:
+            display(HTML(f"<div style='color: red; font-weight: bold;'>ERROR: {str(e)}</div>"))
 
-        N, bins, patches = ax1.hist(finals, bins=30, density=True, orientation='horizontal', edgecolor='white', lw=0.5)
+btn_run.on_click(on_click_run)
 
-        norm = Normalize(vmin=0, vmax=N.max())
-        cmap_hist = plt.get_cmap('Blues')
-        for count, patch in zip(N, patches):
-            patch.set_facecolor(cmap_hist(norm(count)))
-        ax1.tick_params(axis='y', labelleft=False)
+def lbl(text):
+    return widgets.HTML(f"<div class='widget-label'>{text}</div>")
 
-        kde = gaussian_kde(finals)
-        ys = np.linspace(finals.min(), finals.max(), 1000)
-        dens = kde(ys)
-        ax1.plot(dens, ys, color='#5FA8D3', lw=2)
-        ax1.axhline(finals.mean(), color='#5FA8D3', ls='--', lw=1.5)
+panel_assets = widgets.VBox([lbl("Assets (Comma sep)"), w_tickers, lbl("Weights (Comma sep)"), w_weights, lbl("Start Date"), w_start, lbl("Initial Capital"), w_init], layout=widgets.Layout(width='32%', border='1px solid #333', padding='10px', margin='0 5px 0 0'))
+panel_sims = widgets.VBox([lbl("Num Simulations"), w_sims, lbl("Time Horizon (Days)"), w_T, lbl("Risk Free Rate"), w_rf], layout=widgets.Layout(width='32%', border='1px solid #333', padding='10px', margin='0 5px 0 5px'))
+panel_model = widgets.VBox([lbl("Model Features"), w_garch, w_student, widgets.HBox([widgets.Label("Student DoF:"), w_df]), w_regime], layout=widgets.Layout(width='32%', border='1px solid #333', padding='10px', margin='0 0 0 5px'))
 
-        ax1.grid(True, linestyle=':', linewidth=0.7, alpha=0.6)
+ui_body = widgets.HBox([panel_assets, panel_sims, panel_model], layout=widgets.Layout(width='100%', justify_content='space-between'))
+dashboard = widgets.VBox([ui_body, widgets.HTML("<br>"), btn_run, out_res])
 
-        plt.tight_layout()
-        plt.show()
-
-        fig2, ax2 = plt.subplots(figsize=(10, 4))
-        fig2.canvas.header_visible = False
-        fig2.canvas.toolbar_visible = True
-        fig2.canvas.footer_visible = False
-
-        ax2.plot(cumulative_mean, label='Media cumulata', color='navy')
-        ax2.fill_between(np.arange(len(cumulative_mean)), cumulative_mean - stderr, cumulative_mean + stderr,
-        color='navy', alpha=0.2, label='±1 std err')
-        ax2.grid(True, linestyle='--', linewidth=0.6, alpha=0.7)
-        ax2.legend()
-        fig2.tight_layout()
-        plt.show()
-
-
-
-run_btn.on_click(on_run)
-ui = widgets.VBox([tickers_w, weights_w, start_w, sims_w, T_w, init_w, rf_w,
-    run_btn, out], layout=widgets.Layout(border='2px solid navy',
-    padding='10px', border_radius='8px'))
-
-display(ui)
+display(HTML(style_html))
+display(HTML("""
+<div class="quant-container">
+    <div class="quant-header">
+        <div class="quant-title">Monte Carlo Pro <span style="font-size: 14px; color: #008080;">v2.0</span></div>
+        <div class="quant-subtitle">QUANTITATIVE DESK /// ANALYTICS</div>
+    </div>
+</div>
+"""))
+display(dashboard)
+display(HTML("</div>"))
