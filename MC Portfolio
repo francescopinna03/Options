@@ -3,7 +3,7 @@ import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
 from matplotlib import gridspec
-from scipy.stats import gaussian_kde, skew, kurtosis
+from scipy.statistics import gaussian_kde, skew, kurtosis
 from scipy.optimize import minimize
 from matplotlib.colors import Normalize
 import datetime as dt
@@ -16,7 +16,18 @@ from sklearn.preprocessing import StandardScaler
 import warnings
 import plotly.graph_objects as go
 import plotly.io as pio
-from plotly.subplots import make_subplots
+from plotly.subplots import subplots
+import logging
+import contextlib
+import io
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+logging.getLogger("yfinance").setLevel(logging.ERROR)
+
+def yf_wrapper(*args, **kwargs):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        data = yf.download(*args, **kwargs)
+    return data
 
 pio.renderers.default = "iframe"
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -46,28 +57,35 @@ def compute_max_drawdown(path):
 
 def fit_garch(returns, p=1, q=1):
     try:
-        model = arch_model(returns * 100, vol='Garch', p=p, q=q, rescale=False)
+        model = arch_model(returns * 100, volatility='Garch', p=p, q=q, rescale=False)
         res = model.fit(disp='off', show_warning=False)
         forecast = res.forecast(horizon=1)
-        vol_forecast = np.sqrt(forecast.variance.values[-1, 0]) / 100.0
-        return res, vol_forecast
+        volatility_forecast = np.sqrt(forecast.variance.values[-1, 0]) / 100.0
+        return res, volatility_forecast
     except Exception:
         return None, returns.std()
 
 def simulate_student_t(mu, cov, df, n_samples):
     mu = np.asarray(mu)
     cov = np.asarray(cov)
+    try:
+        df_val = float(df)
+    except (TypeError, ValueError):
+        df_val = 5.0
+    if not np.isfinite(df_val) or df_val <= 2.0:
+        df_val = 5.0
+
     d = len(mu)
     z = np.random.multivariate_normal(np.zeros(d), cov, n_samples)
-    chi2 = np.random.chisquare(df, n_samples)
-    t_samples = z * np.sqrt(df / chi2)[:, None]
+    chi2 = np.random.chisquare(df_val, n_samples)
+    t_samples = z * np.sqrt(df_val / chi2)[:, None]
     return mu + t_samples
 
 def detect_regimes_gmm(portfolio_returns, window=20, n_regimes=2, random_state=0):
-    rolling_vol = portfolio_returns.rolling(window=window).std()
+    rolling_volatility = portfolio_returns.rolling(window=window).std()
     rolling_ret = portfolio_returns.rolling(window=window).mean()
 
-    df_feat = pd.DataFrame({'ret': rolling_ret, 'vol': rolling_vol}).dropna()
+    df_feat = pd.DataFrame({'ret': rolling_ret, 'volatility': rolling_volatility}).dropna()
 
     if len(df_feat) < window * 2:
         return None, None, None
@@ -79,21 +97,21 @@ def detect_regimes_gmm(portfolio_returns, window=20, n_regimes=2, random_state=0
     gmm.fit(X)
     raw_states = gmm.predict(X)
 
-    vol_means = []
+    volatility_means = []
     for k in range(n_regimes):
-        vol_means.append(df_feat['vol'][raw_states == k].mean())
-    order = np.argsort(vol_means)
+        volatility_means.append(df_feat['volatility'][raw_states == k].mean())
+    order = np.argsort(volatility_means)
     mapping = {old: new for new, old in enumerate(order)}
     states = np.array([mapping[s] for s in raw_states])
 
     regime_series = pd.Series(states, index=df_feat.index)
 
-    regime_stats = {}
+    regime_statistics = {}
     for reg in range(n_regimes):
         mask = regime_series == reg
         if mask.sum() > 5:
             r_reg = portfolio_returns.loc[regime_series.index[mask]]
-            regime_stats[reg] = {'mean': r_reg.mean(), 'std': r_reg.std(), 'count': mask.sum(), 'prob': mask.sum() / len(regime_series)}
+            regime_statistics[reg] = {'mean': r_reg.mean(), 'std': r_reg.std(), 'count': mask.sum(), 'prob': mask.sum() / len(regime_series)}
 
     transitions = np.zeros((n_regimes, n_regimes))
     values = states
@@ -102,7 +120,7 @@ def detect_regimes_gmm(portfolio_returns, window=20, n_regimes=2, random_state=0
     row_sums = transitions.sum(axis=1, keepdims=True)
     transition_matrix = np.divide(transitions, row_sums, out=np.zeros_like(transitions), where=row_sums != 0)
 
-    return regime_series, regime_stats, transition_matrix
+    return regime_series, regime_statistics, transition_matrix
 
 def simulate_regime_switching(mu_dict, cov_dict, transition_matrix, weights, T, init_value=1.0, init_regime=0):
 
@@ -131,49 +149,409 @@ def simulate_regime_switching(mu_dict, cov_dict, transition_matrix, weights, T, 
 
     return path, regimes_path
 
+def stress_test_scenarios():
+ 
+    return {"COVID Crash (2020)": {"start": dt.date(2020, 2, 19),"end":   dt.date(2020, 3, 23),},
+        "Global Fin. Crisis (2008)": {"start": dt.date(2008, 9, 1), "end":   dt.date(2008, 11, 30),},
+        "Dot-com Bust (2000)": {"start": dt.date(2000, 3, 1), "end":   dt.date(2000, 4, 30),},
+        "Flash Crash (2010)": {"start": dt.date(2010, 5, 3), "end":   dt.date(2010, 5, 10),},}
 
+def run_stress_test(tickers, weights, init_value, scenario_params):
+    start = scenario_params["start"]
+    end = scenario_params["end"]
+    try:
+        prices = yf_wrapper(tickers, start=start, end=end, auto_adjust=False, progress=False)["Close"]
+    except Exception:
+        return None, list(tickers)
 
+    if isinstance(prices, pd.Series):
+        prices = prices.to_frame(tickers[0])
+    all_requested = list(tickers)
+    present_columnss = [c for c in prices.columns if c in all_requested]
+    prices = prices[present_columns]
+    prices = prices.ffill()
+    all_nan_columns = [c for c in prices.columns if prices[c].isna().all()]
 
+    missing = sorted(set([t for t in all_requested if t not in present_columns] + all_nan_columns))
+    prices = prices.drop(columns=all_nan_columns)
+    if prices.shape[1] == 0:
+        return None, missing
+    available_tickers = list(prices.columns)
+    idx = [all_requested.index(t) for t in available_tickers]
+    w_sub = weights[idx]
 
+    if w_sub.sum() == 0:
+        return None, missing
+    w_sub = w_sub / w_sub.sum()
 
+    prices = prices.dropna(how="any")
+    if prices.shape[0] < 2:
+        return None, missing
+    returns = prices.pct_change().dropna()
+    if returns.empty:
+        return None, missing
+    port_ret = returns.dot(w_sub)
+    path = init_value * np.cumprod(1.0 + port_ret.values)
 
+    return path, missing
 
-def run_mc(stocks, weights, start, end, sims_n, T, init, rf):
-    df = yf.download(stocks, start=start, end=end, auto_adjust=False, progress=False)['Close'].ffill()
-    r = df.pct_change().dropna()
-    mu, cov = r.mean(), r.cov()
+def efficient_frontier(mu, cov, n_points=50, rf=0.0425):
+    mu = np.asarray(mu)
+    cov = np.asarray(cov)
+    n_assets = len(mu)
+
+    def portfolio_statistics(w):
+        ret = w.dot(mu) * 252
+        volatility = np.sqrt(w.dot(cov).dot(w)) * np.sqrt(252)
+        return ret, volatility
+
+    def neg_sharpe(w):
+        ret, volatility = portfolio_statistics(w)
+        return -(ret - rf) / (volatility + 1e-9)
+
+    def portfolio_volatility(w):
+        return np.sqrt(w.dot(cov).dot(w)) * np.sqrt(252)
+
+    constraints = {'type': 'eq', 'fun': lambda w: np.sum(w) - 1}
+    bounds = tuple((0, 1) for _ in range(n_assets))
+    w0 = np.ones(n_assets) / n_assets
+
+    min_volatility_result = minimize(portfolio_volatility, w0, method='SLSQP', bounds=bounds, constraints=constraints)
+    min_volatility_ret, min_volatility_std = portfolio_statistics(min_volatility_result.x)
+    max_sharpe_result = minimize(neg_sharpe, w0, method='SLSQP', bounds=bounds, constraints=constraints)
+    max_sharpe_ret, max_sharpe_std = portfolio_statistics(max_sharpe_result.x)
+
+    target_returns = np.linspace(min_volatility_ret, max_sharpe_ret * 1.2, n_points)
+    frontier_volatilityatilities = []
+
+    for target_ret in target_returns:
+        cons = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1}, {'type': 'eq', 'fun': lambda w, tr=target_ret: portfolio_statistics(w)[0] - tr}]
+        res = minimize(portfolio_volatility, w0, method='SLSQP',
+                       bounds=bounds, constraints=cons)
+        if res.success:
+            frontier_volatilityatilities.append(portfolio_volatility(res.x))
+        else:
+            frontier_volatilityatilities.append(np.nan)
+
+    return (target_returns, np.array(frontier_volatilityatilities), (max_sharpe_ret, max_sharpe_std, max_sharpe_result.x), (min_volatility_ret, min_volatility_std, min_volatility_result.x))
+
+def run_mc_analysis(tickers, weights, start, end, sims_n, T, init_value, rf, use_garch=True, use_student_t=True, df_student=5, use_regime_switching=False):
+    try:
+        df_t-stud = int(df_student)
+    except (TypeError, ValueError):
+        df_t-stud = 5
+    if df_t-stud < 3:
+        df_t-stud = 5
+    df_student = df_t-stud
+
+    prices = yf_wrapper(tickers, start=start, end=end, auto_adjust=False, progress=False)['Close'].ffill()
+
+    returns = prices.pct_change().dropna()
+    if isinstance(returns, pd.Series):
+        returns = returns.to_frame(tickers[0])
+
+    mu_base = returns.mean()
+    cov_base = returns.cov()
+    portfolio_returns = returns.dot(weights)
+
+    if use_garch:
+        garch_volatilityatilities = []
+        for col in returns.columns:
+            _, volatility_forecast = fit_garch(returns[col])
+            garch_volatilityatilities.append(volatility_forecast)
+        garch_volatilityatilities = np.array(garch_volatilityatilities)
+        corr = returns.corr().values
+        cov_garch = corr * np.outer(garch_volatilityatilities, garch_volatilityatilities)
+        cov = pd.DataFrame(cov_garch, index=returns.columns, columns=returns.columns)
+        mu = mu_base
+    else:
+        mu, cov = mu_base, cov_base
+
+    regime_info = None
+    mu_dict, cov_dict, transition_matrix, init_regime = None, None, None, 0
+
+    if use_regime_switching:
+        regime_series, regime_statistics, transition_matrix = detect_regimes_gmm(portfolio_returns, n_regimes=2)
+        if regime_statistics is not None and regime_series is not None:
+            mu_dict, cov_dict = {}, {}
+            for reg in regime_statistics.keys():
+                dates_reg = regime_series[regime_series == reg].index
+                if len(dates_reg) > 10:
+                    r_reg = returns.loc[dates_reg]
+                else:
+                    r_reg = returns
+                mu_dict[reg] = r_reg.mean().values
+                cov_dict[reg] = r_reg.cov().values
+
+            if len(regime_series) > 0:
+                init_regime = int(regime_series.iloc[-1])
+
+            regime_info = {'regime_series': regime_series, 'statistics': regime_statistics, 'transition': transition_matrix}
+
+    T = int(T)
+    sims_n = int(sims_n)
     simulations = np.zeros((T, sims_n))
-    finals = np.zeros(sims_n)
+    max_drawdowns = np.zeros(sims_n)
+
     for i in range(sims_n):
-        dr = np.random.multivariate_normal(mu.values, cov.values, T)
-        simulations[:, i] = init * np.cumprod(1 + dr.dot(weights))
-        finals[i] = simulations[-1, i]
-    rets = np.log(simulations[1:] / simulations[:-1]).flatten()
-    ann_ret = rets.mean() * 252
-    ann_vol = rets.std() * np.sqrt(252)
-    downside = rets[rets < 0]
-    sharpe = (ann_ret - rf) / (ann_vol + 1e-9)
+        if use_regime_switching and regime_info is not None and mu_dict is not None:
+            path, _ = simulate_regime_switching(mu_dict, cov_dict, transition_matrix, weights, T, init_value=init_value, init_regime=init_regime)
+            simulations[:, i] = path
+        else:
+            if use_student_t:
+                dr = simulate_student_t(mu.values, cov.values, df_student, T)
+            else:
+                dr = np.random.multivariate_normal(mu.values, cov.values, T)
+
+            port_ret = dr.dot(weights)
+            simulations[:, i] = init_value * np.cumprod(1.0 + port_ret)
+
+        max_drawdowns[i] = compute_max_drawdown(simulations[:, i])
+
+    finals = simulations[-1, :]
+
+    log_rets = np.log(simulations[1:, :] / simulations[:-1, :]).flatten()
+    ann_ret = log_rets.mean() * 252
+    ann_volatility = log_rets.std() * np.sqrt(252)
+    downside = log_rets[log_rets < 0]
+
+    sharpe = (ann_ret - rf) / (ann_volatility + 1e-9)
     sortino = (ann_ret - rf) / (np.std(downside) * np.sqrt(252) + 1e-9)
-    sk = skew(finals); ku = kurtosis(finals, fisher=True)
-    cum_mean = np.cumsum(finals) / np.arange(1, sims_n + 1)
+
+    max_dd_mean = max_drawdowns.mean()
+    statistics = {"Mean": finals.mean(), "Min": finals.min(), "Max": finals.max(), "VaR 5%": np.percentile(finals, 5), "CVaR 5%": compute_cvar(finals, 5), "Ann Ret %": ann_ret * 100,
+        "Ann volatility %": ann_volatility * 100, "Sharpe": sharpe, "Sortino": sortino, "Calmar": ann_ret / (abs(max_dd_mean) + 1e-9), "MaxDD Mean %": max_dd_mean * 100, "MaxDD Worst %": max_drawdowns.min() * 100,
+        "Loss Prob %": (finals < init_value).mean() * 100, "Skew": skew(finals), "Kurt": kurtosis(finals)}
+
+    cumulative_mean = np.cumsum(finals) / np.arange(1, sims_n + 1)
     stderr = np.std(finals, ddof=1) / np.sqrt(np.arange(1, sims_n + 1))
-    return simulations, finals, (cum_mean, stderr), {"Media simulazione": cum_mean[-1], "Minimo": finals.min(), "Massimo": finals.max(), "5° percentile (VaR)": np.percentile(finals, 5),
-        "95° percentile": np.percentile(finals, 95), "CVaR 5%": compute_cvar(finals), "Rendimento annuo %": ann_ret * 100, "Volatilità annua %": ann_vol * 100,
-        "Sharpe Ratio": sharpe, "Sortino Ratio": sortino, "Skewness": sk, "Kurtosis": ku, "StdErr media": stderr[-1], "CoeffVar": stderr[-1] / cum_mean[-1]}
+    scenarios = stress_test_scenarios()
+    stress_results = {}
+    for name, params in scenarios.items():
+        path_stress, missing = run_stress_test(tickers, weights, init_value, params)
+        if path_stress is None or len(path_stress) == 0:
+            stress_results[name] = {"final":   np.nan, "ret":     np.nan, "dd":      np.nan, "missing": missing}
+        else:
+            stress_results[name] = {"final":   path_stress[-1], "ret":     (path_stress[-1] / init_value - 1.0) * 100, "dd":      compute_max_drawdown(path_stress) * 100, "missing": missing}
 
-layout = widgets.Layout(width='80%')
-tickers_w = widgets.Text(value='META,NVDA', description='Tickers:', layout=layout)
-weights_w = widgets.Text(value='0.5,0.5', description='Pesi:', layout=layout)
-start_w = widgets.DatePicker(value=dt.date.today()-dt.timedelta(days=300), description='Inizio:', layout=layout)
-sims_w = widgets.IntSlider(value=10000, min=1000, max=20000, step=1000, description='Simulazioni:', layout=layout)
-T_w = widgets.IntSlider(value=252, min=30, max=365, step=1, description='Giorni T:', layout=layout)
-init_w = widgets.IntText(value=10000, description='Valore iniziale:', layout=layout)
-rf_w = widgets.FloatText(value=0.0425, description='Risk‑free %:', layout=layout)
-run_btn = widgets.Button(description='Esegui simulazione', style=widgets.ButtonStyle(button_color='#5FA8D3'))
-out = widgets.Output()
+    try:
+        frontier = efficient_frontier(mu_base, cov_base)
+    except Exception:
+        frontier = None
 
-def smart_val_format(x):
-    return f"{x:.2e}" if abs(x) < 0.01 else f"{x:,.2f}"
+    return (simulations, finals, max_drawdowns, (cumulative_mean, stderr), statistics, stress_results, frontier, (mu_base, cov_base), regime_info)
+
+def plots_2d(simulations, finals, max_drawdowns, cumulative_mean, stderr, init_value, frontier_data, mu, cov, weights, tickers):
+    with plt.style.context('dark_background'):
+        fig = plt.figure(figsize=(18, 12), facecolor=COLOR_BG)
+        gs = gridspec.GridSpec(3, 2, height_ratios=[2, 1.5, 1.5], hspace=0.35, wspace=0.2)
+
+        ax0 = fig.add_subplot(gs[0, 0])
+        ax0.set_facecolor(COLOR_BG)
+        n_plot = min(simulations.shape[1], 800)
+        cmap = plt.get_cmap('cool')
+        step = max(1, simulations.shape[1] // n_plot)
+        for i in range(0, simulations.shape[1], step):
+            ax0.plot(simulations[:, i], color=cmap(i / simulations.shape[1]), alpha=0.15, lw=0.8)
+        ax0.axhline(init_value, color=COLOR_ACCENT_2, ls='--', lw=2, label='Initial Capital')
+        ax0.set_title('MONTE CARLO TRAJECTORIES', fontsize=12, fontweight='bold', color=COLOR_ACCENT_1, loc='left')
+        ax0.grid(color=COLOR_GRID, linestyle=':', linewidth=0.5)
+        ax0.set_ylabel('Portfolio Value', color=COLOR_TEXT)
+        ax0.legend(facecolor=COLOR_BG, edgecolor=COLOR_GRID, fontsize=9)
+
+        ax1 = fig.add_subplot(gs[0, 1], sharey=ax0)
+        ax1.set_facecolor(COLOR_BG)
+        N, bins, patches = ax1.hist(finals, bins=40, density=True, orientation='horizontal', edgecolor=COLOR_BG, alpha=0.6)
+        norm = Normalize(vmin=min(finals), vmax=max(finals))
+        for thisbin, patch in zip(bins, patches):
+            patch.set_facecolor(plt.cm.cool(norm(thisbin)))
+
+        kde = gaussian_kde(finals)
+        ys = np.linspace(finals.min(), finals.max(), 500)
+        ax1.plot(kde(ys), ys, color='white', lw=2, label='KDE')
+        ax1.axhline(finals.mean(), color=COLOR_ACCENT_1, ls='-', lw=2, label=f'Mean: {finals.mean():,.0f}')
+        ax1.axhline(np.percentile(finals, 5), color='red', ls='--', lw=2, label=f'VaR 5%: {np.percentile(finals, 5):,.0f}')
+        ax1.set_title('FINAL VALUE DISTRIBUTION', fontsize=12, fontweight='bold', color=COLOR_ACCENT_1, loc='left')
+        ax1.grid(color=COLOR_GRID, linestyle=':', linewidth=0.5)
+        ax1.legend(facecolor=COLOR_BG, edgecolor=COLOR_GRID, fontsize=9)
+        plt.setp(ax1.get_yticklabels(), visible=False)
+
+        ax2 = fig.add_subplot(gs[1, 0])
+        ax2.set_facecolor(COLOR_BG)
+        ax2.hist(max_drawdowns * 100, bins=50, color='#ff3333', alpha=0.6, edgecolor=COLOR_BG)
+        ax2.axvline(max_drawdowns.mean() * 100, color='white', ls='--', label='Mean DD')
+        ax2.set_title('MAX DRAWDOWN DISTRIBUTION (%)', fontsize=12, fontweight='bold', color=COLOR_ACCENT_2, loc='left')
+        ax2.grid(color=COLOR_GRID, linestyle=':', linewidth=0.5)
+        ax2.set_xlabel('Drawdown (%)')
+        ax2.legend(facecolor=COLOR_BG, edgecolor=COLOR_GRID)
+
+        ax3 = fig.add_subplot(gs[1, 1])
+        ax3.set_facecolor(COLOR_BG)
+        ax3.plot(cumulative_mean, color=COLOR_ACCENT_1, lw=1.5, label='Cumulative Mean')
+        ax3.fill_between(np.arange(len(cumulative_mean)), cumulative_mean - 2 * stderr, cumulative_mean + 2 * stderr, color=COLOR_ACCENT_1, alpha=0.2)
+        ax3.set_title('CONVERGENCE CHECK', fontsize=12, fontweight='bold', color=COLOR_ACCENT_1, loc='left')
+        ax3.grid(color=COLOR_GRID, linestyle=':', linewidth=0.5)
+
+        if frontier_data is not None:
+            ax4 = fig.add_subplot(gs[2, :])
+            ax4.set_facecolor(COLOR_BG)
+
+            rets, volatilityatilities, max_sh, min_volatility = frontier_data
+            volatilityatilities = np.array(volatilityatilities)
+            rets = np.array(rets)
+            valid = ~np.isnan(volatilityatilities)
+            ax4.plot(volatilityatilities[valid], rets[valid],
+                     color='white', lw=2, alpha=0.8, label='Efficient Frontier')
+
+            ax4.scatter(max_sh[1], max_sh[0], s=150, marker='*', color=COLOR_ACCENT_2, edgecolors='white', zorder=5, label='Max Sharpe')
+            ax4.scatter(min_volatility[1], min_volatility[0], s=100, marker='D', color=COLOR_ACCENT_1, edgecolors='black', zorder=5, label='Min volatility')
+
+            mu_arr = mu.values
+            cov_arr = cov.values
+            port_ret = weights.dot(mu_arr) * 252
+            port_volatility = np.sqrt(weights.dot(cov_arr).dot(weights) * 252)
+            ax4.scatter(port_volatility, port_ret, s=120, marker='o', color='#ff3333', edgecolors='white', zorder=5, label='Current Portfolio')
+
+            ax4.set_title( 'MARKOWITZ EFFICIENT FRONTIER', fontsize=12, fontweight='bold', color=COLOR_ACCENT_3, loc='left')
+            ax4.set_xlabel('Annualized volatilityatility')
+            ax4.set_ylabel('Annualized Return')
+            ax4.grid(color=COLOR_GRID, linestyle=':', linewidth=0.5)
+            ax4.legend(facecolor=COLOR_BG, edgecolor=COLOR_GRID)
+
+        plt.tight_layout()
+        plt.show()
+
+def plots_3d(simulations, finals):
+    T, sims_n = simulations.shape
+
+    fig = 3d_subplots{rows=1, cols=3, specs=[[{"type": "surface"}, {"type": "scene"}, {"type": "scene"}]], subplot_titles=["Percentiles Evolatilityution Surface", "Risk-Return Space 3D", "Simulated Paths 3D"])
+    percentiles = [5, 25, 50, 75, 95]
+    time_points = np.arange(T)
+    Z = np.array([[np.percentile(simulations[t, :], p) for t in time_points] for p in percentiles])
+
+    fig.add_trace(go.Surface(z=Z, x=time_points, y=percentiles, colorscale='Viridis', showscale=False, opacity=0.9), row=1, col=1)
+    sample_size = min(2000, sims_n)
+    idx = np.random.choice(sims_n, sample_size, replace=False)
+    base = simulations[0, 0] if simulations[0, 0] != 0 else finals.mean()
+    ret_samp = (finals[idx] / base - 1.0) * 100
+    volatility_samp = (np.std(simulations[:, idx], axis=0) / (np.mean(simulations[:, idx], axis=0) + 1e-9) * 100)
+    sharpe_samp = ret_samp / (volatility_samp + 1e-9)
+
+    fig.add_trace(go.Scatter3d(x=ret_samp, y=volatility_samp, z=sharpe_samp, mode='markers', marker=dict(size=3, color=sharpe_samp, colorscale='Portland', opacity=0.8, showscale=True, colorbar=dict(title="Sharpe-like"))), row=1, col=2)
+
+    n_paths = min(60, sims_n)
+    idx_paths = np.linspace(0, sims_n - 1, n_paths, dtype=int)
+    time_vec = np.arange(T)
+
+    for j, k in enumerate(idx_paths):
+        fig.add_trace(go.Scatter3d(x=time_vec, y=np.full_like(time_vec, j), z=simulations[:, k], mode='lines', line=dict(width=1), showlegend=False), row=1, col=3)
+
+    fig.update_layout(template="plotly_dark", height=550, width=1400, margin=dict(l=10, r=10, b=10, t=40), paper_bgcolor=COLOR_BG, font=dict(family="Courier New, monospace", size=11, color=COLOR_TEXT))
+    fig.update_scenes(dict(xaxis=dict(title="Time (days)", autorange='reversed'), yaxis=dict(title="Percentile"), zaxis=dict(title="Portfolio Value")), row=1, col=1)
+
+    fig.update_scenes(dict(xaxis=dict(title="Return %"), yaxis=dict(title="Coeff. of Variation %"), zaxis=dict(title="Sharpe-like")), row=1, col=2)
+    fig.update_scenes(dict(xaxis=dict(title="Time (days)", autorange='reversed'), yaxis=dict(title="Path index"), zaxis=dict(title="Value")), row=1, col=3)
+
+    return fig
+    
+style_html = """
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;700&display=swap');
+    
+    .quant-container {
+        background-color: #0e0e0e;
+        color: #e0e0e0;
+        font-family: 'Roboto Mono', monospace;
+        padding: 20px;
+        border: 1px solid #444;
+        box-shadow: 0 0 15px rgba(0,0,0,0.8);
+    }
+    .quant-header {
+        border-bottom: 2px solid #cc9500;
+        margin-bottom: 15px;
+        padding-bottom: 5px;
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+    }
+    .quant-title {
+        font-size: 24px;
+        font-weight: 700;
+        color: #cc9500;
+        text-transform: uppercase;
+        letter-spacing: 2px;
+    }
+    .quant-subtitle {
+        font-size: 12px;
+        color: #777;
+    }
+    .widget-label {
+        color: #008080 !important;
+        font-weight: bold;
+        font-size: 11px;
+        text-transform: uppercase;
+        margin-bottom: 5px;
+    }
+    .dataframe {
+        background-color: #e0e0e0 !important;
+        color: #000000 !important; 
+        border-collapse: collapse !important;
+        border: 1px solid #444444 !important;
+        font-family: 'Roboto Mono', monospace !important;
+        font-size: 12px !important;
+        width: 100%;
+    }
+    .dataframe th {
+        background-color: #c0c0c0 !important;
+        color: #000000 !important;
+        text-transform: uppercase;
+        font-weight: bold;
+        border: 1px solid #444444 !important;
+        padding: 6px 8px !important;
+    }
+    .dataframe td {
+        padding: 6px 8px !important;
+        border: 1px solid #b0b0b0 !important;
+    }
+    .dataframe tr:hover {
+        background-color: #b8c0ff !important;  
+    }
+    .dataframe tr:hover td {
+        color: #000000 !important; 
+    }
+</style>
+"""
+
+style_w = {'description_width': 'initial'}
+layout_w = widgets.Layout(width='95%')
+
+w_tickers = widgets.Text(value='SPY,TLT,GLD', placeholder='Ticker List', description='', layout=layout_w)
+w_weights = widgets.Text(value='0.5, 0.3, 0.2', placeholder='Weights', description='', layout=layout_w)
+w_start = widgets.DatePicker(value=dt.date.today() - dt.timedelta(days=730), description='', layout=layout_w)
+w_init = widgets.IntText(value=100000, description='', layout=layout_w)
+w_sims = widgets.IntSlider(value=5000, min=500, max=50000, step=500, description='', layout=layout_w)
+w_T = widgets.IntSlider(value=252, min=20, max=504, step=1, description='', layout=layout_w)
+w_rf = widgets.FloatText(value=0.04, step=0.0025, description='', layout=layout_w)
+w_garch = widgets.Checkbox(value=True, description='GARCH(1,1)', indent=False)
+w_student = widgets.Checkbox(value=True, description='t-Student', indent=False)
+w_regime = widgets.Checkbox(value=False, description='Regime Switch', indent=False)
+w_df = widgets.IntSlider(value=5, min=3, max=30, description='DoF', layout=widgets.Layout(width='150px'))
+btn_run = widgets.Button(description='RUN SIMULATION', layout=widgets.Layout(width='100%', height='50px'), style=widgets.ButtonStyle(button_color='#cc9500'))
+out_res = widgets.Output(layout=widgets.Layout(padding='10px'))
+
+def format_stats_horizontal(stats):
+    data = {'Performance': {'Mean Final': f"{stats['Mean']:,.0f}", 'Ann Return': f"{stats['Ann Ret %']:.2f}%", 'Loss Prob': f"{stats['Loss Prob %']:.1f}%"},
+        'Risk Metrics': {'Vol (Ann)': f"{stats['Ann Vol %']:.2f}%", 'VaR 5%': f"{stats['VaR 5%']:,.0f}", 'CVaR 5%': f"{stats['CVaR 5%']:,.0f}", 'Max DD': f"{stats['MaxDD Mean %']:.2f}%"},
+        'Ratios': {'Sharpe': f"{stats['Sharpe']:.2f}", 'Sortino': f"{stats['Sortino']:.2f}", 'Calmar': f"{stats['Calmar']:.2f}"}}
+
+    html_str = "<div style='display: flex; gap: 20px; width: 100%; justify-content: space-around;'>"
+    for cat in data:
+        sub_df = pd.DataFrame(data[cat].items(), columns=['Metric', 'Value'])
+        html_str += f"<div style='flex: 1;'><h4 style='color: #008080; border-bottom: 1px solid #444;'>{cat}</h4>"
+        html_str += sub_df.to_html(index=False, classes='dataframe', border=0)
+        html_str += "</div>"
+    html_str += "</div>"
+    return html_str
 
 def on_run(_):
     with out:
@@ -185,9 +563,9 @@ def on_run(_):
         if abs(total_weight - 1.0) > 1e-4:
             raise ValueError(f"La somma dei pesi deve essere 1. Somma attuale = {total_weight:.4f}")
 
-        simulations, finals, (cum_mean, stderr), stats = run_mc(tk, w, start_w.value, dt.date.today(), sims_w.value, T_w.value, init_w.value, rf_w.value)
+        simulations, finals, (cumulative_mean, stderr), statistics = run_mc(tk, w, start_w.value, dt.date.today(), sims_w.value, T_w.value, init_w.value, rf_w.value)
 
-        df = pd.DataFrame(stats.items(), columns=['Statistica', 'Valore'])
+        df = pd.DataFrame(statistics.items(), columns=['Statistica', 'Valore'])
         sty = (df.style.format({'Valore': smart_val_format}).background_gradient('Blues', subset=['Valore']).set_table_styles([{'selector': 'th', 'props': [('background-color', '#003366'), ('color', 'white'),('font-size', '14px')]},{'selector': 'td', 'props': [('padding', '6px'), ('font-size', '13px')]}]).set_caption("Statistiche Monte Carlo"))
         display(sty)
 
@@ -232,8 +610,8 @@ def on_run(_):
         fig2.canvas.toolbar_visible = True
         fig2.canvas.footer_visible = False
 
-        ax2.plot(cum_mean, label='Media cumulata', color='navy')
-        ax2.fill_between(np.arange(len(cum_mean)), cum_mean - stderr, cum_mean + stderr,
+        ax2.plot(cumulative_mean, label='Media cumulata', color='navy')
+        ax2.fill_between(np.arange(len(cumulative_mean)), cumulative_mean - stderr, cumulative_mean + stderr,
         color='navy', alpha=0.2, label='±1 std err')
         ax2.grid(True, linestyle='--', linewidth=0.6, alpha=0.7)
         ax2.legend()
