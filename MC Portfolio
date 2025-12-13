@@ -57,7 +57,7 @@ def compute_max_drawdown(path):
 
 def fit_garch(returns, p=1, q=1):
     try:
-        model = arch_model(returns * 100, volatility='Garch', p=p, q=q, rescale=False)
+        model = arch_model(returns * 100, vol='Garch', p=p, q=q, rescale=False)
         res = model.fit(disp='off', show_warning=False)
         forecast = res.forecast(horizon=1)
         volatility_forecast = np.sqrt(forecast.variance.values[-1, 0]) / 100.0
@@ -319,9 +319,9 @@ def run_mc_analysis(tickers, weights, start, end, sims_n, T, init_value, rf, use
     sortino = (ann_ret - rf) / (np.std(downside) * np.sqrt(252) + 1e-9)
 
     max_dd_mean = max_drawdowns.mean()
-    statistics = {"Mean": finals.mean(), "Min": finals.min(), "Max": finals.max(), "VaR 5%": np.percentile(finals, 5), "CVaR 5%": compute_cvar(finals, 5), "Ann Ret %": ann_ret * 100,
-        "Ann volatility %": ann_volatility * 100, "Sharpe": sharpe, "Sortino": sortino, "Calmar": ann_ret / (abs(max_dd_mean) + 1e-9), "MaxDD Mean %": max_dd_mean * 100, "MaxDD Worst %": max_drawdowns.min() * 100,
-        "Loss Prob %": (finals < init_value).mean() * 100, "Skew": skew(finals), "Kurt": kurtosis(finals)}
+    statistics = {"Mean": finals.mean(), "Min": finals.min(), "Max": finals.max(), "VaR 5%": np.percentile(finals, 5), "CVaR 5%": compute_cvar(finals, 5), "Ann Ret %": ann_ret * 100, "Ann Vol %": ann_volatility * 100, "Sharpe": sharpe, "Sortino": sortino, "Calmar": ann_ret / (abs(max_dd_mean) + 1e-9),
+        "MaxDD Mean %": max_dd_mean * 100, "MaxDD Worst %": max_drawdowns.min() * 100, "Loss Prob %": (finals < init_value).mean() * 100, "Skew": skew(finals), "Kurt": kurtosis(finals),}
+
 
     cumulative_mean = np.cumsum(finals) / np.arange(1, sims_n + 1)
     stderr = np.std(finals, ddof=1) / np.sqrt(np.arange(1, sims_n + 1))
